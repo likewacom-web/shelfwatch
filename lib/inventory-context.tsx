@@ -419,13 +419,13 @@ export function InventoryProvider({ children }: PropsWithChildren) {
     onProgress?.({ percent: 50, message: "กำลังรวบรวมรูปภาพสินค้า" });
     const collectedImages = await collectBackupImages(profileEntries, (completed, total) => {
       const imageProgress = total > 0 ? Math.round((completed / total) * 20) : 20;
-      onProgress?.({ percent: 50 + imageProgress, message: total > 0 ? `กำลังสำรองรูปภาพ ${completed} จาก ${total} รูป` : "ไม่พบรูปภาพที่ต้องสำรอง" });
+      onProgress?.({ percent: 50 + imageProgress, message: total > 0 ? `กำลังตรวจรูปภาพ ${completed} จาก ${total} รูป` : "ไม่พบรูปภาพที่ต้องสำรอง" });
     });
     if (collectedImages.skippedImageCount > 0) {
-      onProgress?.({ percent: 72, message: `ข้ามรูปภาพ ${collectedImages.skippedImageCount} รายการที่อ่านไม่ได้หรือมีขนาดเกินกำหนด` });
+      onProgress?.({ percent: 72, message: `ข้ามรูปภาพ ${collectedImages.skippedImageCount} รายการที่อ่านไม่ได้` });
     }
     onProgress?.({ percent: 76, message: "กำลังจัดเตรียมไฟล์สำรอง" });
-    return createInventoryBackup({ activeUserId, profiles: profileEntries, images: collectedImages.images, skippedImageCount: collectedImages.skippedImageCount });
+    return createInventoryBackup({ activeUserId, profiles: profileEntries, images: collectedImages.images, imageFiles: collectedImages.imageFiles, skippedImageCount: collectedImages.skippedImageCount });
   }, [activeUserId, profiles]);
 
   const restoreBackupData = useCallback(async (sourceBackup: InventoryBackup, onProgress?: BackupProgressCallback) => {

@@ -11,6 +11,19 @@ export interface InventoryBackupImage {
   extension: string;
 }
 
+/**
+ * An image stored as its own file inside a .zip backup (instead of base64 inside the JSON).
+ * `localUri` only exists in memory: the original file while exporting, or the extracted
+ * file while restoring. It is never written into backup.json.
+ */
+export interface InventoryBackupImageFile {
+  sourceUri: string;
+  path: string;
+  extension: string;
+  size: number;
+  localUri?: string;
+}
+
 export interface InventoryBackupProfile extends UserProfile {
   products: Product[];
   deletedProducts?: DeletedProduct[];
@@ -25,6 +38,7 @@ export interface InventoryBackup {
   activeUserId: string;
   profiles: InventoryBackupProfile[];
   images: InventoryBackupImage[];
+  imageFiles?: InventoryBackupImageFile[];
   skippedImageCount?: number;
 }
 
@@ -32,6 +46,7 @@ export interface InventoryBackupInput {
   activeUserId: string;
   profiles: InventoryBackupProfile[];
   images?: InventoryBackupImage[];
+  imageFiles?: InventoryBackupImageFile[];
   skippedImageCount?: number;
   createdAt?: string;
 }
@@ -229,6 +244,16 @@ function normalizeImage(value: unknown): InventoryBackupImage {
   return { sourceUri: requiredString(value.sourceUri, "ที่อยู่รูปสินค้า"), base64, extension };
 }
 
+function normalizeImageFile(value: unknown): InventoryBackupImageFile {
+  if (!isRecord(value)) throw new Error("ไฟล์สำรองมีข้อมูลไฟล์รูปไม่ถูกต้อง");
+  const path = requiredString(value.path, "ตำแหน่งไฟล์รูป");
+  if (!/^images\/[A-Za-z0-9._-]+$/.test(path)) throw new Error("ไฟล์สำรองมีตำแหน่งไฟล์รูปไม่ถูกต้อง");
+  const extension = requiredString(value.extension, "นามสกุลรูปสินค้า").replace(/^\./, "").toLowerCase();
+  if (!/^[a-z0-9]{2,5}$/.test(extension)) throw new Error("ไฟล์สำรองมีนามสกุลรูปสินค้าไม่ถูกต้อง");
+  const size = typeof value.size === "number" && Number.isFinite(value.size) && value.size >= 0 ? Math.floor(value.size) : 0;
+  return { sourceUri: requiredString(value.sourceUri, "ที่อยู่รูปสินค้า"), path, extension, size, localUri: optionalString(value.localUri) };
+}
+
 export function normalizeInventoryBackup(value: unknown): InventoryBackup {
   if (!isRecord(value)) throw new Error("ไม่พบข้อมูลไฟล์สำรองของ ShelfWatch");
   if (value.type !== INVENTORY_BACKUP_FILE_TYPE) throw new Error("ไฟล์นี้ไม่ใช่ไฟล์สำรองของ ShelfWatch");
@@ -242,6 +267,7 @@ export function normalizeInventoryBackup(value: unknown): InventoryBackup {
   if (!profiles.some((profile) => profile.id === activeUserId)) throw new Error("ไม่พบผู้ใช้ที่กำลังใช้งานในไฟล์สำรอง");
   const images = value.images.map(normalizeImage);
   if (new Set(images.map((image) => image.sourceUri)).size !== images.length) throw new Error("ไฟล์สำรองมีรูปสินค้าซ้ำกัน");
+  const imageFiles = Array.isArray(value.imageFiles) ? value.imageFiles.map(normalizeImageFile) : [];
   return {
     type: INVENTORY_BACKUP_FILE_TYPE,
     schemaVersion: INVENTORY_BACKUP_SCHEMA_VERSION,
@@ -249,6 +275,7 @@ export function normalizeInventoryBackup(value: unknown): InventoryBackup {
     activeUserId,
     profiles,
     images,
+    imageFiles,
     skippedImageCount: typeof value.skippedImageCount === "number" && value.skippedImageCount > 0 ? Math.floor(value.skippedImageCount) : 0,
   };
 }
@@ -261,6 +288,7 @@ export function createInventoryBackup(input: InventoryBackupInput): InventoryBac
     activeUserId: input.activeUserId,
     profiles: input.profiles,
     images: input.images ?? [],
+    imageFiles: input.imageFiles ?? [],
     skippedImageCount: input.skippedImageCount ?? 0,
   });
 }
@@ -276,7 +304,8 @@ export function parseInventoryBackup(serialized: string): InventoryBackup {
 }
 
 export function serializeInventoryBackup(backup: InventoryBackup): string {
-  return JSON.stringify(backup);
+  const imageFiles = (backup.imageFiles ?? []).map(({ sourceUri, path, extension, size }) => ({ sourceUri, path, extension, size }));
+  return JSON.stringify({ ...backup, imageFiles });
 }
 
 export function getInventoryBackupSummary(backup: InventoryBackup): InventoryBackupSummary {
@@ -285,7 +314,7 @@ export function getInventoryBackupSummary(backup: InventoryBackup): InventoryBac
     profileCount: backup.profiles.length,
     productCount: backup.profiles.reduce((total, profile) => total + profile.products.length, 0),
     historyCount: backup.profiles.reduce((total, profile) => total + profile.positionHistory.length, 0),
-    imageCount: backup.images.length,
+    imageCount: backup.images.length + (backup.imageFiles?.length ?? 0),
   };
 }
 

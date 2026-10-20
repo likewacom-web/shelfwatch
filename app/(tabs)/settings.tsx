@@ -17,6 +17,7 @@ import { getUpdateConnectionStatus } from "@/lib/update-status";
 import { clearExpiryNotifications, requestExpiryNotificationPermission, sendTestExpiryNotification, syncExpiryNotifications } from "@/lib/expiry-notifications";
 import { getInventoryBackupRestorePreview, getInventoryBackupSummary, parseInventoryBackup, serializeInventoryBackup, type InventoryBackup } from "@/lib/inventory-backup";
 import { hydrateBackupImages, readInventoryBackupText, saveAndShareInventoryBackup } from "@/lib/inventory-backup-files";
+import { isZipFile, readZipBackup } from "@/lib/backup-zip";
 import { useInventory } from "@/lib/inventory-context";
 
 const QUICK_THRESHOLD_OPTIONS = [1, 3, 7, 14, 30];
@@ -148,10 +149,11 @@ function formatBackupSize(bytes: number): string {
 }
 
 function getBackupImageBytes(backup: InventoryBackup): number {
-  return backup.images.reduce((total, image) => {
+  const embedded = backup.images.reduce((total, image) => {
     const padding = image.base64.endsWith("==") ? 2 : image.base64.endsWith("=") ? 1 : 0;
     return total + Math.max(0, Math.floor(image.base64.length * 0.75) - padding);
   }, 0);
+  return embedded + (backup.imageFiles ?? []).reduce((total, imageFile) => total + imageFile.size, 0);
 }
 
 function ExportPreviewModal({ backup, brandColor, onCancel, onConfirm }: { backup: InventoryBackup | null; brandColor: string; onCancel: () => void; onConfirm: () => void }) {
@@ -319,12 +321,14 @@ export default function SettingsScreen() {
     const backup = pendingExportBackup;
     setPendingExportBackup(null);
     setIsExporting(true);
-    setBackupProgress({ operation: "export", percent: 90, message: "กำลังเปิดหน้าต่างบันทึกไฟล์" });
+    setBackupProgress({ operation: "export", percent: 80, message: "กำลังรวมรูปภาพลงไฟล์สำรอง" });
     try {
-      await saveAndShareInventoryBackup(serializeInventoryBackup(backup));
+      const saved = await saveAndShareInventoryBackup(backup, (completed, total) => {
+        setBackupProgress({ operation: "export", percent: 80 + Math.round((completed / Math.max(1, total)) * 18), message: `กำลังเขียนรูปภาพ ${completed} จาก ${total} รูป` });
+      });
       setBackupProgress({ operation: "export", percent: 100, message: "สร้างไฟล์สำรองเสร็จสมบูรณ์" });
       const summary = getInventoryBackupSummary(backup);
-      Alert.alert(backup.skippedImageCount ? "สร้างไฟล์สำรองแล้ว แต่มีรูปภาพถูกข้าม" : "สร้างไฟล์สำรองแล้ว", backup.skippedImageCount ? `สำรองรูปภาพสำเร็จ ${summary.imageCount} รูป และข้าม ${backup.skippedImageCount} รูปที่อ่านหรือบีบอัดไม่ได้` : `สำรองผู้ใช้ ${summary.profileCount} คน สินค้า ${summary.productCount} รายการ ประวัติ ${summary.historyCount} รายการ และรูปภาพ ${summary.imageCount} รูปเรียบร้อย`);
+      Alert.alert(saved.skippedImageCount ? "สร้างไฟล์สำรองแล้ว แต่มีรูปภาพถูกข้าม" : "สร้างไฟล์สำรองแล้ว", saved.skippedImageCount ? `สำรองรูปภาพสำเร็จ ${saved.imageCount} รูป และข้าม ${saved.skippedImageCount} รูปที่อ่านไม่ได้` : `สำรองผู้ใช้ ${summary.profileCount} คน สินค้า ${summary.productCount} รายการ ประวัติ ${summary.historyCount} รายการ และรูปภาพ ${saved.imageCount} รูปเรียบร้อย`);
     } catch (error) {
       Alert.alert("สำรองข้อมูลไม่สำเร็จ", errorMessage(error, "ไม่สามารถสร้างไฟล์สำรองได้ โปรดลองอีกครั้ง"));
     } finally {
@@ -366,16 +370,25 @@ export default function SettingsScreen() {
     if (isRestoring) return;
     try {
       const result = await DocumentPicker.getDocumentAsync({
-        type: ["application/json", "text/json", "text/plain"],
+        // .zip (new, with photos) and .json (older backups). Some file managers report zip files
+        // with odd MIME types, so native accepts any file and checks the content instead.
+        type: Platform.OS === "web" ? ["application/json", "text/json", "text/plain"] : "*/*",
         copyToCacheDirectory: true,
       });
       if (result.canceled) return;
       const asset = result.assets[0];
       if (!asset) throw new Error("ไม่พบไฟล์สำรองที่เลือก");
       setBackupProgress({ operation: "restore", percent: 8, message: "กำลังอ่านไฟล์สำรองที่เลือก" });
-      const content = await readInventoryBackupText(asset.uri, asset.file);
-      setBackupProgress({ operation: "restore", percent: 22, message: "กำลังตรวจสอบรูปแบบไฟล์สำรอง" });
-      const backup = parseInventoryBackup(content);
+      let backup: InventoryBackup;
+      if (Platform.OS !== "web" && isZipFile(asset.uri)) {
+        backup = await readZipBackup(asset.uri, (completed, total) => {
+          setBackupProgress({ operation: "restore", percent: 8 + Math.round((completed / Math.max(1, total)) * 20), message: "กำลังแตกไฟล์สำรองและรูปภาพ" });
+        });
+      } else {
+        const content = await readInventoryBackupText(asset.uri, asset.file);
+        setBackupProgress({ operation: "restore", percent: 22, message: "กำลังตรวจสอบรูปแบบไฟล์สำรอง" });
+        backup = parseInventoryBackup(content);
+      }
       setBackupProgress(null);
       setPendingRestoreBackup(backup);
     } catch (error) {
@@ -456,7 +469,7 @@ export default function SettingsScreen() {
         <View style={styles.sectionHeader}><Text style={styles.sectionTitle}>สำรองและกู้คืนข้อมูล</Text><Text style={styles.sectionCopy}>สร้างไฟล์เดียวสำหรับข้อมูลผู้ใช้ สินค้า ล็อต การตั้งค่า และประวัติทั้งหมด เพื่อนำไปเก็บไว้หรือกู้คืนบนอุปกรณ์เครื่องนี้</Text></View>
         <Pressable accessibilityRole="button" disabled={isExporting || isRestoring || Boolean(backupProgress)} onPress={exportBackup} style={({ pressed }) => [styles.backupButton, (pressed || isExporting || isRestoring || Boolean(backupProgress)) && styles.pressed]}><MaterialIcons name="file-upload" size={20} color="#FFFFFF" /><Text style={styles.backupButtonText}>{isExporting ? "กำลังสร้างไฟล์สำรอง" : "สำรองข้อมูลเป็นไฟล์"}</Text></Pressable>
         <Pressable accessibilityRole="button" disabled={isExporting || isRestoring || Boolean(backupProgress)} onPress={chooseBackupFile} style={({ pressed }) => [styles.restoreButton, (pressed || isExporting || isRestoring || Boolean(backupProgress)) && styles.pressed]}><MaterialIcons name="file-download" size={20} color="#1D4ED8" /><Text style={styles.restoreButtonText}>{isRestoring ? "กำลังกู้คืนข้อมูล" : "เลือกไฟล์เพื่อกู้คืน"}</Text></Pressable>
-        <Text style={styles.backupNote}>บน iPhone และ Android รูปสินค้าจะรวมในไฟล์สำรองตามขนาดไฟล์ที่รองรับ ส่วนเว็บจะสำรองข้อมูลรายการ แต่ไม่รวมไฟล์รูปเดิม</Text>
+        <Text style={styles.backupNote}>บน iPhone และ Android ไฟล์สำรองเป็น .zip ที่รวมรูปสินค้า รูปโปรไฟล์ และภาพพื้นหลังทุกรูปแบบความละเอียดเดิม กู้คืนได้ทั้งไฟล์ .zip ใหม่และไฟล์ .json แบบเก่า</Text>
         <Pressable accessibilityRole="button" onPress={() => router.push("/(tabs)/category-management")} style={({ pressed }) => [styles.archivedButton, pressed && styles.pressed]}><MaterialIcons name="category" size={20} color="#1D4ED8" /><Text style={styles.archivedButtonText}>จัดการหมวดหมู่สินค้า</Text></Pressable>
         <Pressable accessibilityRole="button" onPress={() => router.push("/(tabs)/archived")} style={({ pressed }) => [styles.archivedButton, pressed && styles.pressed]}><MaterialIcons name="inventory" size={20} color="#344054" /><Text style={styles.archivedButtonText}>ดูรายการสินค้าที่ลบแล้ว</Text></Pressable>
       </View>
