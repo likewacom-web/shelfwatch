@@ -11,6 +11,7 @@ import { ActivityIndicator, Alert, Animated, Image, KeyboardAvoidingView, Linkin
 
 import { ScreenContainer } from "@/components/screen-container";
 import { OcrCropModal } from "@/components/ocr-crop-modal";
+import { computeGuideCrop, type Rect } from "@/lib/ocr-guide-crop";
 import { ProductFlowStepper } from "@/components/product-flow-stepper";
 import { useInventory } from "@/lib/inventory-context";
 import { persistProductImage } from "@/lib/product-image";
@@ -49,6 +50,17 @@ function withOcrTimeout<T>(promise: Promise<T>): Promise<T> {
       (value) => { clearTimeout(timer); resolve(value); },
       (error) => { clearTimeout(timer); reject(error); },
     );
+  });
+}
+
+function measureInWindow(view: View | null): Promise<Rect | null> {
+  return new Promise((resolve) => {
+    if (!view) { resolve(null); return; }
+    try {
+      view.measureInWindow((x, y, width, height) => resolve(width > 0 && height > 0 ? { x, y, width, height } : null));
+    } catch {
+      resolve(null);
+    }
   });
 }
 
@@ -114,6 +126,10 @@ export default function ProductFormScreen() {
   const ocrReportTransition = useRef(new Animated.Value(1)).current;
   const previousCorrectedOcrName = useRef("");
   const labelCameraRef = useRef<CameraView>(null);
+  const labelCameraScreenRef = useRef<View>(null);
+  const labelGuideFrameRef = useRef<View>(null);
+  // Full-size photo of the last quick read, so "crop and retry" can start from the whole picture.
+  const ocrFullPhotoRef = useRef<OcrAsset | null>(null);
   const productCameraRef = useRef<CameraView>(null);
 
   useEffect(() => () => {
@@ -460,9 +476,10 @@ export default function ProductFormScreen() {
     const base64 = asset.base64 ?? await FileSystem.readAsStringAsync(asset.uri, { encoding: FileSystem.EncodingType.Base64 });
     if (!base64) throw new Error("missing-image-data");
     const mimeType = asset.mimeType?.startsWith("image/") ? asset.mimeType : asset.uri.toLowerCase().endsWith(".png") ? "image/png" : "image/jpeg";
+    const startedAt = Date.now();
     const response = await withOcrTimeout(readProductLabelImage(base64, mimeType));
     if (response.productName) {
-      showToast("ส่งภาพเข้า OCR สำเร็จ · ได้ผลการอ่านแล้ว", "ocr");
+      showToast(`อ่านชื่อสินค้าเสร็จใน ${((Date.now() - startedAt) / 1000).toFixed(1)} วินาที`, "ocr");
       await reviewOcrName(response.productName, response.productCandidates ?? []);
       return true;
     }
@@ -489,7 +506,7 @@ export default function ProductFormScreen() {
     Alert.alert(reason ? "อ่านชื่อสินค้าไม่สำเร็จ" : "อ่านชื่อสินค้าไม่ชัด", reason ?? "ระบบยังอ่านข้อความจากภาพเดิมไม่ได้ ลองอ่านซ้ำได้ทันที หรือครอบภาพใหม่ให้เห็นชื่อสินค้าใหญ่ขึ้น", [
       { text: "กรอกชื่อเอง", style: "cancel" },
       { text: "ถ่าย/เลือกภาพใหม่", onPress: () => void readProductLabel() },
-      { text: "ครอบภาพก่อนอ่านซ้ำ", onPress: () => setOcrCropAsset(asset) },
+      { text: "ครอบภาพก่อนอ่านซ้ำ", onPress: () => setOcrCropAsset(ocrFullPhotoRef.current ?? asset) },
       { text: "ลองอ่านซ้ำ", onPress: () => void retryLastOcrRead() },
     ]);
   };
@@ -607,12 +624,21 @@ export default function ProductFormScreen() {
     try {
       // exif: false makes expo-camera rotate the pixels upright itself and skip the EXIF tag.
       // With exif: true the photo stayed unrotated, then got rotated twice in the crop screen (sideways text).
-      const result = await labelCameraRef.current.takePictureAsync({ quality: 0.9, base64: false, exif: false });
+      const [screen, frame] = await Promise.all([measureInWindow(labelCameraScreenRef.current), measureInWindow(labelGuideFrameRef.current)]);
+      const result = await labelCameraRef.current.takePictureAsync({ quality: 0.8, base64: false, exif: false });
       if (result) {
         closeLabelCamera();
         previousCorrectedOcrName.current = "";
         setCorrectedOcrName("");
-        setOcrCropAsset(result);
+        // Fast path: crop to the on-screen guide frame and read straight away (no crop screen).
+        const crop = computeGuideCrop(result.width, result.height, screen ?? { x: 0, y: 0, width: 0, height: 0 }, frame);
+        const small = await ImageManipulator.manipulateAsync(
+          result.uri,
+          [{ crop: { originX: crop.x, originY: crop.y, width: crop.width, height: crop.height } }, { resize: { width: Math.min(1024, crop.width) } }],
+          { compress: 0.8, format: ImageManipulator.SaveFormat.JPEG, base64: true },
+        );
+        ocrFullPhotoRef.current = result;
+        await confirmCroppedLabel({ uri: small.uri, base64: small.base64 });
       }
     } catch {
       Alert.alert("ถ่ายภาพไม่สำเร็จ", "ลองจัดฉลากให้อยู่ในกรอบอีกครั้ง แล้วกดถ่ายใหม่");
@@ -628,7 +654,12 @@ export default function ProductFormScreen() {
       if (!result.canceled && result.assets[0]) {
         previousCorrectedOcrName.current = "";
         setCorrectedOcrName("");
-        setOcrCropAsset(result.assets[0]);
+        // Fast path: shrink and read the whole picture; the crop screen is offered only if reading fails.
+        const picked = result.assets[0];
+        const landscape = (picked.width ?? 0) >= (picked.height ?? 0);
+        const small = await ImageManipulator.manipulateAsync(picked.uri, [{ resize: landscape ? { width: 1280 } : { height: 1280 } }], { compress: 0.8, format: ImageManipulator.SaveFormat.JPEG, base64: true });
+        ocrFullPhotoRef.current = picked;
+        await confirmCroppedLabel({ uri: small.uri, base64: small.base64 });
       }
     } catch {
       Alert.alert("อ่านฉลากไม่สำเร็จ", "กรุณาเลือกรูปฉลากใหม่ หรือนำชื่อสินค้ามาพิมพ์เอง", [
@@ -932,11 +963,11 @@ export default function ProductFormScreen() {
           {editingProduct ? <Pressable accessibilityRole="button" disabled={isSaving} onPress={() => requestSaveConfirmation("newLot")} style={({ pressed }) => [styles.newLotButton, (pressed || isSaving) && styles.pressed]}><MaterialIcons name="library-add" size={20} color="#1F6F5B" /><View style={styles.newLotCopy}><Text style={styles.newLotTitle}>บันทึกเป็นล็อตใหม่</Text><Text style={styles.newLotSubtitle}>คงล็อตเดิมไว้และสร้างรายการใหม่</Text></View></Pressable> : null}
         </ScrollView>
       <Modal visible={isLabelCameraVisible} animationType="slide" onRequestClose={closeLabelCamera}>
-        <View style={styles.labelCameraModal}>
+        <View ref={labelCameraScreenRef} collapsable={false} style={styles.labelCameraModal}>
           <CameraView ref={labelCameraRef} style={StyleSheet.absoluteFill} facing="back" zoom={labelCameraZoom} enableTorch={isLabelTorchOn} />
           <View style={styles.labelCameraOverlay}>
             <View style={styles.labelCameraTopBar}><Pressable accessibilityRole="button" accessibilityLabel="ปิดกล้องถ่ายชื่อสินค้า" onPress={closeLabelCamera} style={({ pressed }) => [styles.cameraCloseButton, pressed && styles.pressed]}><MaterialIcons name="close" size={24} color="#FFFFFF" /></Pressable><Text style={styles.labelCameraTitle}>ถ่ายชื่อสินค้า</Text><Pressable accessibilityRole="button" accessibilityLabel={isLabelTorchOn ? "ปิดไฟฉาย" : "เปิดไฟฉาย"} onPress={() => setIsLabelTorchOn((current) => !current)} style={({ pressed }) => [styles.cameraCloseButton, isLabelTorchOn && styles.cameraTorchButtonActive, pressed && styles.pressed]}><MaterialIcons name={isLabelTorchOn ? "flash-on" : "flash-off"} size={22} color="#FFFFFF" /></Pressable></View>
-            <View style={styles.labelTargetArea}><View style={styles.labelTargetFrame}><View style={[styles.targetCorner, styles.targetCornerTopLeft]} /><View style={[styles.targetCorner, styles.targetCornerTopRight]} /><View style={[styles.targetCorner, styles.targetCornerBottomLeft]} /><View style={[styles.targetCorner, styles.targetCornerBottomRight]} /></View><Text style={styles.labelTargetHint}>วางชื่อสินค้าให้อยู่ในกรอบ</Text><Text style={styles.labelTargetSubhint}>เข้าใกล้ฉลากและหลีกเลี่ยงแสงสะท้อน</Text></View>
+            <View style={styles.labelTargetArea}><View ref={labelGuideFrameRef} collapsable={false} style={styles.labelTargetFrame}><View style={[styles.targetCorner, styles.targetCornerTopLeft]} /><View style={[styles.targetCorner, styles.targetCornerTopRight]} /><View style={[styles.targetCorner, styles.targetCornerBottomLeft]} /><View style={[styles.targetCorner, styles.targetCornerBottomRight]} /></View><Text style={styles.labelTargetHint}>วางชื่อสินค้าให้อยู่ในกรอบ</Text><Text style={styles.labelTargetSubhint}>เข้าใกล้ฉลากและหลีกเลี่ยงแสงสะท้อน</Text></View>
             <View style={styles.labelCameraBottomBar}><View style={styles.cameraPresetRow}>{LABEL_ZOOM_PRESETS.map((preset) => { const isActive = Math.abs(labelCameraZoom - preset.value) < 0.01; return <Pressable key={preset.label} accessibilityRole="button" accessibilityLabel={`ตั้งซูม ${preset.label} ${(1 + preset.value * 2).toFixed(1)} เท่า`} onPress={() => setLabelCameraZoom(preset.value)} style={({ pressed }) => [styles.cameraPresetButton, isActive && styles.cameraPresetButtonActive, pressed && styles.pressed]}><MaterialIcons name={preset.value === 0 ? "center-focus-strong" : "zoom-in"} size={15} color={isActive ? "#0F5132" : "#FFFFFF"} /><Text style={[styles.cameraPresetText, isActive && styles.cameraPresetTextActive]}>{preset.label}</Text></Pressable>; })}</View><View style={styles.cameraZoomControls}><Pressable accessibilityRole="button" accessibilityLabel="ลดซูม" onPress={() => adjustLabelCameraZoom(-0.2)} disabled={labelCameraZoom <= 0} style={({ pressed }) => [styles.cameraControlButton, pressed && styles.pressed, labelCameraZoom <= 0 && styles.disabledButton]}><MaterialIcons name="remove" size={22} color="#FFFFFF" /></Pressable><Pressable accessibilityRole="button" accessibilityLabel="รีเซ็ตซูม" onPress={() => setLabelCameraZoom(0)} style={({ pressed }) => [styles.cameraZoomValue, pressed && styles.pressed]}><Text style={styles.cameraZoomValueText}>{`${(1 + labelCameraZoom * 2).toFixed(1)}x`}</Text></Pressable><Pressable accessibilityRole="button" accessibilityLabel="เพิ่มซูม" onPress={() => adjustLabelCameraZoom(0.2)} disabled={labelCameraZoom >= 1} style={({ pressed }) => [styles.cameraControlButton, pressed && styles.pressed, labelCameraZoom >= 1 && styles.disabledButton]}><MaterialIcons name="add" size={22} color="#FFFFFF" /></Pressable></View><View style={styles.cameraSliderRow}><Text style={styles.cameraSliderLabel}>1.0x</Text><Slider accessibilityLabel="ปรับระดับซูม" minimumValue={0} maximumValue={1} step={0.01} value={labelCameraZoom} onValueChange={setLabelCameraZoom} minimumTrackTintColor="#34D399" maximumTrackTintColor="rgba(255,255,255,0.42)" thumbTintColor="#FFFFFF" style={styles.cameraSlider} /><Text style={styles.cameraSliderLabel}>3.0x</Text></View><Pressable accessibilityRole="button" accessibilityLabel="ถ่ายภาพชื่อสินค้า" onPress={() => void captureLabelPhoto()} disabled={isReadingLabel} style={({ pressed }) => [styles.captureLabelButton, pressed && styles.pressed, isReadingLabel && styles.disabledButton]}>{isReadingLabel ? <ActivityIndicator color="#1F6F5B" /> : <View style={styles.captureLabelInner} />}</Pressable><Text style={styles.captureLabelHint}>{isLabelTorchOn ? "เปิดไฟฉายแล้ว · " : ""}ซูม {`${(1 + labelCameraZoom * 2).toFixed(1)}x`} · กดปุ่มเพื่อถ่ายภาพ</Text></View>
           </View>
         </View>

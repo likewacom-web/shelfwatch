@@ -39,7 +39,7 @@ jobs:
       - name: Type check and tests
         run: |
           pnpm exec tsc --noEmit
-          pnpm exec vitest run tests/ocr.test.ts tests/ocr-pipeline.test.ts tests/inventory.test.ts tests/inventory-backup.test.ts tests/backup-zip.test.ts
+          pnpm exec vitest run tests/ocr.test.ts tests/ocr-pipeline.test.ts tests/inventory.test.ts tests/inventory-backup.test.ts tests/backup-zip.test.ts tests/ocr-guide-crop.test.ts
 
       - name: Generate native Android project
         run: npx expo prebuild --platform android --no-install

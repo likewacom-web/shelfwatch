@@ -21,7 +21,7 @@ type WorkingAsset = { uri: string; width?: number; height?: number; exif?: Recor
 type CropBox = { x: number; y: number; width: number; height: number };
 
 const MAX_WORKING_SIDE = 2400;
-const OCR_TARGET_WIDTH = 1600;
+const OCR_TARGET_WIDTH = 1024;
 
 /**
  * Re-encode the photo so its pixels are upright and not oversized.

@@ -7,15 +7,22 @@ import * as SecureStore from "expo-secure-store";
 import { Platform } from "react-native";
 
 import { collectOcrProductCandidates } from "@/lib/ocr";
-import { clampOcrConfidence, mergeOcrLines, parseLlmJson } from "@/lib/ocr-pipeline";
+import { clampOcrConfidence, parseLlmJson } from "@/lib/ocr-pipeline";
 
 const API_KEY_STORAGE_KEY = "shelfwatch.geminiApiKey";
 const OCR_REPORTS_KEY = "shelfwatch.ocrReports";
 const GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models";
-// Tried in order. "-latest" aliases follow Google's current Flash models; the pinned
-// names are fallbacks in case an alias is unavailable for this key.
-export const GEMINI_MODELS = ["gemini-flash-latest", "gemini-2.5-flash", "gemini-flash-lite-latest", "gemini-2.5-flash-lite"];
-const REQUEST_TIMEOUT_MS = 45_000;
+// Tried in order, fastest first. Reading a label does not need the model to "think", so thinking
+// is switched off where the model allows it (that alone saves several seconds per photo).
+// "-latest" aliases are fallbacks in case a pinned model is unavailable for this key.
+type ModelOption = { model: string; thinking?: Record<string, unknown> };
+export const GEMINI_MODELS: ModelOption[] = [
+  { model: "gemini-2.5-flash", thinking: { thinkingBudget: 0 } },
+  { model: "gemini-flash-lite-latest", thinking: { thinkingBudget: 0 } },
+  { model: "gemini-flash-latest", thinking: { thinkingBudget: 0 } },
+  { model: "gemini-2.5-flash-lite" },
+];
+const REQUEST_TIMEOUT_MS = 30_000;
 
 export class GeminiError extends Error {
   constructor(public code: "no-key" | "bad-key" | "quota" | "network" | "timeout" | "server", message: string) {
@@ -70,7 +77,7 @@ export function maskApiKey(key: string): string {
 type GeminiSchema = Record<string, unknown>;
 type GeminiRequest = { system: string; prompt: string; imageBase64?: string; mimeType?: string; schema: GeminiSchema; maxOutputTokens?: number };
 
-let workingModel: string | null = null;
+let workingModel: ModelOption | null = null;
 
 async function postWithTimeout(url: string, body: unknown): Promise<Response> {
   const controller = new AbortController();
@@ -104,22 +111,26 @@ async function callGeminiJson<T extends object>(request: GeminiRequest, apiKeyOv
     },
   };
 
-  const models = workingModel ? [workingModel, ...GEMINI_MODELS.filter((m) => m !== workingModel)] : GEMINI_MODELS;
+  const models = workingModel ? [workingModel, ...GEMINI_MODELS.filter((m) => m.model !== workingModel?.model)] : GEMINI_MODELS;
   let lastError: GeminiError = new GeminiError("server", "no model available");
-  for (const model of models) {
-    const response = await postWithTimeout(`${GEMINI_ENDPOINT}/${model}:generateContent?key=${encodeURIComponent(apiKey)}`, body);
-    if (response.ok) {
-      workingModel = model;
-      const json = (await response.json()) as { candidates?: { content?: { parts?: { text?: string; thought?: boolean }[] } }[] };
-      const text = (json.candidates?.[0]?.content?.parts ?? []).filter((part) => !part.thought).map((part) => part.text ?? "").join("");
-      return parseLlmJson<T>(text);
+  for (const option of models) {
+    // A model that rejects the thinking setting is retried once without it.
+    for (const thinking of option.thinking ? [option.thinking, undefined] : [undefined]) {
+      const requestBody = thinking ? { ...body, generationConfig: { ...body.generationConfig, thinkingConfig: thinking } } : body;
+      const response = await postWithTimeout(`${GEMINI_ENDPOINT}/${option.model}:generateContent?key=${encodeURIComponent(apiKey)}`, requestBody);
+      if (response.ok) {
+        workingModel = { model: option.model, thinking };
+        const json = (await response.json()) as { candidates?: { content?: { parts?: { text?: string; thought?: boolean }[] } }[] };
+        const text = (json.candidates?.[0]?.content?.parts ?? []).filter((part) => !part.thought).map((part) => part.text ?? "").join("");
+        return parseLlmJson<T>(text);
+      }
+      const errorText = await response.text().catch(() => "");
+      if (response.status === 400 && /API key not valid|API_KEY_INVALID/i.test(errorText)) throw new GeminiError("bad-key", errorText);
+      if (response.status === 401 || response.status === 403) throw new GeminiError("bad-key", errorText);
+      if (response.status === 400 && thinking && /thinking/i.test(errorText)) continue;
+      lastError = new GeminiError(response.status === 429 ? "quota" : "server", `${response.status} ${errorText}`);
+      break; // try the next model
     }
-    const errorText = await response.text().catch(() => "");
-    if (response.status === 400 && /API key not valid|API_KEY_INVALID/i.test(errorText)) throw new GeminiError("bad-key", errorText);
-    if (response.status === 401 || response.status === 403) throw new GeminiError("bad-key", errorText);
-    if (response.status === 429) { lastError = new GeminiError("quota", errorText); continue; }
-    if (response.status === 404 || response.status === 400) { lastError = new GeminiError("server", errorText); continue; }
-    lastError = new GeminiError("server", `${response.status} ${errorText}`);
   }
   throw lastError;
 }
@@ -150,31 +161,30 @@ export async function detectProductNameBox(imageBase64: string): Promise<LabelBo
 export type ProductLabelResult = { productName: string; productCandidates: string[]; detectedText: string; confidence: number };
 
 export async function readProductLabelImage(imageBase64: string, mimeType = "image/jpeg"): Promise<ProductLabelResult> {
-  type Raw = { lines: unknown; productName: string; confidence: unknown; productCandidates: unknown };
+  type Raw = { productName: string; confidence: unknown; productCandidates: unknown };
+  // Only the name and a few alternatives are requested (no full transcription):
+  // fewer output tokens is the main thing that makes the reply fast.
   const result = await callGeminiJson<Raw>({
-    system: "คุณเป็นระบบอ่านชื่อสินค้าจากภาพฉลาก/ป้ายสินค้าไทย ขั้นแรกถอดข้อความทุกบรรทัดตามที่เห็นจริง (lines) รักษาสระ วรรณยุกต์ และตัวการันต์ ห้ามเดาข้อความที่มองไม่เห็น จากนั้นเลือกชื่อสินค้า (productName) = แบรนด์ + ชื่อ/รุ่น/รสชาติ ตามที่ปรากฏ เช่น 'นมจืด ไทย-เดนมาร์ก' หรือ 'มาม่า รสต้มยำกุ้ง' ห้ามใช้ราคา ปริมาณ น้ำหนัก หน่วย วันผลิต วันหมดอายุ เลขล็อต เลข อย. บาร์โค้ด หรือคำโฆษณาเป็นชื่อ ถ้าภาพมีภาษาอังกฤษให้คงตามที่เห็น productCandidates คือชื่อที่เป็นไปได้ไม่เกิน 5 แบบ เรียงจากมั่นใจมากไปน้อย (รวม productName เป็นตัวแรก) confidence คือความมั่นใจของ productName 0 ถึง 1 ถ้าไม่พบชื่อสินค้าเลยให้ productName เป็นสตริงว่าง",
-    prompt: "อ่านชื่อสินค้าจากภาพนี้",
+    system: "อ่านชื่อสินค้าจากภาพป้าย/ฉลากสินค้าไทย productName = แบรนด์ + ชื่อ/รุ่น/รสชาติ ตามตัวอักษรที่เห็นจริง รักษาสระ วรรณยุกต์ ตัวการันต์ และภาษาอังกฤษตามที่เห็น ห้ามใช้ราคา ปริมาณ น้ำหนัก หน่วย วันผลิต วันหมดอายุ เลขล็อต บาร์โค้ด หรือคำโฆษณาเป็นชื่อ productCandidates = ชื่อที่เป็นไปได้ไม่เกิน 3 แบบ เรียงจากมั่นใจมากไปน้อย confidence = 0 ถึง 1 ถ้าไม่เห็นชื่อสินค้าให้ productName เป็นสตริงว่าง",
+    prompt: "ชื่อสินค้าในภาพนี้คืออะไร",
     imageBase64,
     mimeType,
     schema: {
       type: "OBJECT",
       properties: {
-        lines: { type: "ARRAY", items: { type: "STRING" } },
         productName: { type: "STRING" },
         confidence: { type: "NUMBER" },
         productCandidates: { type: "ARRAY", items: { type: "STRING" } },
       },
-      required: ["lines", "productName", "confidence", "productCandidates"],
-      propertyOrdering: ["lines", "productName", "confidence", "productCandidates"],
+      required: ["productName", "confidence", "productCandidates"],
+      propertyOrdering: ["productName", "confidence", "productCandidates"],
     },
   });
-  const detectedText = mergeOcrLines("", result.lines);
   const productName = typeof result.productName === "string" ? result.productName : "";
   const rawConfidence = clampOcrConfidence(result.confidence);
   const confidence = rawConfidence > 0 ? rawConfidence : productName ? 0.5 : 0;
-  let candidates = collectOcrProductCandidates(productName, result.productCandidates, confidence);
-  if (candidates.length === 0 && detectedText) candidates = collectOcrProductCandidates("", detectedText.split("\n").slice(0, 5), 0.5);
-  return { productName: candidates[0] ?? "", productCandidates: candidates, detectedText, confidence };
+  const candidates = collectOcrProductCandidates(productName, result.productCandidates, confidence);
+  return { productName: candidates[0] ?? "", productCandidates: candidates, detectedText: "", confidence };
 }
 
 export async function suggestNameCorrections(productName: string): Promise<string[]> {
