@@ -8,6 +8,7 @@ import { useEffect, useRef, useState } from "react";
 import { ActivityIndicator, Alert, Animated, Linking, Modal, Platform, Pressable, ScrollView, StyleSheet, Switch, Text, TextInput, View } from "react-native";
 
 import { ScreenContainer } from "@/components/screen-container";
+import { GeminiKeyCard } from "@/components/gemini-key-card";
 import { checkForUpdateManually } from "@/components/update-prompt";
 import { getDisplayAppVersion } from "@/lib/app-version";
 import { CURRENT_CHANGELOG } from "@/lib/changelog";
@@ -438,6 +439,8 @@ export default function SettingsScreen() {
           <Switch value={settings.nameFieldHighlightEnabled} onValueChange={(enabled) => void updateSettings({ nameFieldHighlightEnabled: enabled })} trackColor={{ false: "#D0D5DD", true: "#77AD9F" }} thumbColor={settings.nameFieldHighlightEnabled ? "#1F6F5B" : "#F9FAFB"} />
         </View>
       </View>
+
+      <GeminiKeyCard />
 
       <View style={styles.card}>
         <View style={styles.sectionIcon}><MaterialIcons name="system-update" size={21} color="#1F6F5B" /></View>

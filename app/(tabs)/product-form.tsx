@@ -14,7 +14,7 @@ import { OcrCropModal } from "@/components/ocr-crop-modal";
 import { ProductFlowStepper } from "@/components/product-flow-stepper";
 import { useInventory } from "@/lib/inventory-context";
 import { persistProductImage } from "@/lib/product-image";
-import { trpc } from "@/lib/trpc";
+import { GeminiError, describeGeminiError, detectProductNameBox, getGeminiApiKey, readProductLabelImage, saveOcrReport } from "@/lib/gemini-ocr";
 import { calculateExpiryDate, createISODateFromParts, findProductAtPosition, findProductByCode, formatDateParts, getDatePartsForInput, findDuplicateBarcode, getNextAvailableItemNumber, getNextBatchNumber, getProductCategories, getProductGradeLabel, getProductGradeTheme, getProductLots, normalizeProductCategory, type DateInputParts, type Product, type ProductDateType, type ProductGrade } from "@/lib/inventory";
 
 type FormValues = {
@@ -115,9 +115,6 @@ export default function ProductFormScreen() {
   const previousCorrectedOcrName = useRef("");
   const labelCameraRef = useRef<CameraView>(null);
   const productCameraRef = useRef<CameraView>(null);
-  const readLabelMutation = trpc.ocr.productLabel.useMutation();
-  const detectYellowLabelMutation = trpc.ocr.detectYellowLabel.useMutation();
-  const recordBoxFeedbackMutation = trpc.ocr.recordBoxFeedback.useMutation();
 
   useEffect(() => () => {
     if (toastTimer.current) clearTimeout(toastTimer.current);
@@ -161,8 +158,7 @@ export default function ProductFormScreen() {
   const playStatusSound = () => {
     void statusSoundPlayer.seekTo(0).then(() => statusSoundPlayer.play()).catch(() => statusSoundPlayer.play());
   };
-  const suggestCorrectionsMutation = trpc.ocr.suggestCorrections.useMutation();
-  const reportOcrErrorMutation = trpc.ocr.reportError.useMutation();
+  const [isReportingOcr, setIsReportingOcr] = useState(false);
   const normalizedOcrText = normalizeReportedOcrText(ocrDraft);
   const normalizedCorrectedOcrName = normalizeReportedOcrText(correctedOcrName);
   const correctedNameMatchesOcr = Boolean(normalizedOcrText && normalizedCorrectedOcrName && normalizedOcrText === normalizedCorrectedOcrName);
@@ -436,16 +432,9 @@ export default function ProductFormScreen() {
     setOcrDraft(productName);
     setOcrSuggestions([...new Set(lensCandidates.filter(Boolean).filter((candidate) => candidate !== productName))].slice(0, 5));
     setIsOcrReviewVisible(true);
-    setIsCheckingOcr(true);
-    try {
-      const result = await suggestCorrectionsMutation.mutateAsync({ productName });
-      setOcrSuggestions((current) => [...new Set([...current, ...result.suggestions])].slice(0, 5));
-    } catch {
-      // Keep the original OCR result usable when the optional AI review is unavailable.
-      setOcrSuggestions([]);
-    } finally {
-      setIsCheckingOcr(false);
-    }
+    // The OCR call already returns alternative names, so no second AI request is made here
+    // (saves the free Gemini quota).
+    setIsCheckingOcr(false);
   };
 
   const detectYellowLabel = async (asset: OcrAsset) => {
@@ -453,26 +442,25 @@ export default function ProductFormScreen() {
       // Box detection only needs a preview-sized image; the box is returned in 0-1 coordinates.
       const preview = await ImageManipulator.manipulateAsync(asset.uri, [{ resize: (asset.width ?? 0) >= (asset.height ?? 0) ? { width: 1280 } : { height: 1280 } }], { compress: 0.8, format: ImageManipulator.SaveFormat.JPEG, base64: true });
       if (!preview.base64) throw new Error("missing-image-data");
-      const result = await withOcrTimeout(detectYellowLabelMutation.mutateAsync({ imageDataUrl: `data:image/jpeg;base64,${preview.base64}` }));
+      const result = await withOcrTimeout(detectProductNameBox(preview.base64));
       if (result.confidence < 0.25) showToast("ระบบไม่มั่นใจกรอบชื่อสินค้า ลองปรับกรอบด้วยตนเองได้");
       return result;
     } catch (error) {
-      showToast("หากรอบอัตโนมัติไม่สำเร็จ ลากกรอบเองได้เลย", "warning");
+      showToast(error instanceof GeminiError ? describeGeminiError(error) : "หากรอบอัตโนมัติไม่สำเร็จ ลากกรอบเองได้เลย", "warning");
       throw error;
     }
   };
 
   const recordBoxDecision = (event: { eventType: "selection" | "finalize"; userChoice: "auto" | "manual"; confidence: number | null; suggestedBox: { x: number; y: number; width: number; height: number } | null; finalBox: { x: number; y: number; width: number; height: number } | null; note: string }) => {
-    void recordBoxFeedbackMutation.mutateAsync(event).catch(() => {
-      // Analytics must never block the OCR flow when the network is unavailable.
-    });
+    // Box feedback used to be sent to the Manus server; the standalone app keeps no analytics.
+    void event;
   };
 
   const processProductLabelAsset = async (asset: OcrAsset) => {
     const base64 = asset.base64 ?? await FileSystem.readAsStringAsync(asset.uri, { encoding: FileSystem.EncodingType.Base64 });
     if (!base64) throw new Error("missing-image-data");
     const mimeType = asset.mimeType?.startsWith("image/") ? asset.mimeType : asset.uri.toLowerCase().endsWith(".png") ? "image/png" : "image/jpeg";
-    const response = await withOcrTimeout(readLabelMutation.mutateAsync({ imageDataUrl: `data:${mimeType};base64,${base64}` }));
+    const response = await withOcrTimeout(readProductLabelImage(base64, mimeType));
     if (response.productName) {
       showToast("ส่งภาพเข้า OCR สำเร็จ · ได้ผลการอ่านแล้ว", "ocr");
       await reviewOcrName(response.productName, response.productCandidates ?? []);
@@ -481,11 +469,24 @@ export default function ProductFormScreen() {
     return false;
   };
 
-  const showOcrRetryAlert = (asset: OcrAsset) => {
+  const handleOcrFailure = (asset: OcrAsset, error: unknown) => {
+    if (error instanceof GeminiError && (error.code === "no-key" || error.code === "bad-key")) {
+      setLastOcrAsset(asset);
+      setOcrReadStatus("failed");
+      Alert.alert("ต้องตั้งค่า Gemini API key", describeGeminiError(error), [
+        { text: "ปิด", style: "cancel" },
+        { text: "ไปที่ตั้งค่า", onPress: () => router.push("/(tabs)/settings") },
+      ]);
+      return;
+    }
+    showOcrRetryAlert(asset, error instanceof GeminiError ? describeGeminiError(error) : undefined);
+  };
+
+  const showOcrRetryAlert = (asset: OcrAsset, reason?: string) => {
     setLastOcrAsset(asset);
     setOcrReportResolved(false);
     setOcrReadStatus("failed");
-    Alert.alert("อ่านชื่อสินค้าไม่ชัด", "ระบบยังอ่านข้อความจากภาพเดิมไม่ได้ ลองอ่านซ้ำได้ทันที หรือครอบภาพใหม่ให้เห็นชื่อสินค้าใหญ่ขึ้น", [
+    Alert.alert(reason ? "อ่านชื่อสินค้าไม่สำเร็จ" : "อ่านชื่อสินค้าไม่ชัด", reason ?? "ระบบยังอ่านข้อความจากภาพเดิมไม่ได้ ลองอ่านซ้ำได้ทันที หรือครอบภาพใหม่ให้เห็นชื่อสินค้าใหญ่ขึ้น", [
       { text: "กรอกชื่อเอง", style: "cancel" },
       { text: "ถ่าย/เลือกภาพใหม่", onPress: () => void readProductLabel() },
       { text: "ครอบภาพก่อนอ่านซ้ำ", onPress: () => setOcrCropAsset(asset) },
@@ -507,8 +508,8 @@ export default function ProductFormScreen() {
         setLastOcrAsset(null);
         setOcrReadStatus("success");
       } else showOcrRetryAlert(asset);
-    } catch {
-      showOcrRetryAlert(asset);
+    } catch (error) {
+      handleOcrFailure(asset, error);
     } finally {
       setIsReadingLabel(false);
     }
@@ -516,7 +517,7 @@ export default function ProductFormScreen() {
 
   const reportOcrError = async () => {
     const asset = lastOcrAsset;
-    if (!asset || reportOcrErrorMutation.isPending) return;
+    if (!asset || isReportingOcr) return;
     const correctedName = correctedOcrName.trim();
     if (!correctedName) {
       Alert.alert("กรุณาระบุชื่อสินค้าที่ถูกต้อง", "ชื่อที่กรอกจะถูกแนบไปกับภาพเพื่อใช้เป็นข้อมูลอ้างอิงในการปรับปรุง OCR");
@@ -527,14 +528,15 @@ export default function ProductFormScreen() {
       return;
     }
     try {
-      const base64 = asset.base64 ?? await FileSystem.readAsStringAsync(asset.uri, { encoding: FileSystem.EncodingType.Base64 });
-      const mimeType = asset.mimeType?.startsWith("image/") ? asset.mimeType : "image/jpeg";
-      await reportOcrErrorMutation.mutateAsync({ imageDataUrl: `data:${mimeType};base64,${base64}`, ocrText: ocrDraft.trim(), correctedText: correctedName });
+      setIsReportingOcr(true);
+      await saveOcrReport({ ocrText: ocrDraft.trim(), correctedText: correctedName });
       setCorrectedOcrName("");
       previousCorrectedOcrName.current = "";
-      showToast("ส่งรายงานภาพที่อ่านผิดแล้ว ขอบคุณสำหรับข้อมูล");
+      showToast("บันทึกชื่อที่ถูกต้องไว้ในเครื่องแล้ว");
     } catch {
-      Alert.alert("ส่งรายงานไม่สำเร็จ", "ตรวจสอบการเชื่อมต่ออินเทอร์เน็ตแล้วลองใหม่อีกครั้ง");
+      Alert.alert("บันทึกรายงานไม่สำเร็จ", "ลองใหม่อีกครั้ง");
+    } finally {
+      setIsReportingOcr(false);
     }
   };
 
@@ -552,6 +554,13 @@ export default function ProductFormScreen() {
   };
 
   const readProductLabel = async () => {
+    if (!(await getGeminiApiKey())) {
+      Alert.alert("ตั้งค่าก่อนใช้งานครั้งแรก", "การอ่านชื่อสินค้าจากรูปใช้ Google Gemini ใส่ API key (ฟรี) ในหน้าตั้งค่าก่อนนะ", [
+        { text: "ปิด", style: "cancel" },
+        { text: "ไปที่ตั้งค่า", onPress: () => router.push("/(tabs)/settings") },
+      ]);
+      return;
+    }
     if (Platform.OS === "web") {
       Alert.alert("ถ่ายรูปบนเว็บ", "เวอร์ชันเว็บไม่สามารถเปิดกล้องของอุปกรณ์ผ่านปุ่มนี้ได้ กรุณาเลือกรูปฉลากจากเครื่องแทน", [
         { text: "ยกเลิก", style: "cancel" },
@@ -645,8 +654,8 @@ export default function ProductFormScreen() {
         setLastOcrAsset(null);
         setOcrReadStatus("success");
       } else showOcrRetryAlert(asset);
-    } catch {
-      showOcrRetryAlert(asset);
+    } catch (error) {
+      handleOcrFailure(asset, error);
     } finally {
       setIsReadingLabel(false);
     }
@@ -850,7 +859,7 @@ export default function ProductFormScreen() {
               </View>
               {ocrReadStatus !== "idle" && ocrReadAttempt > 0 ? <View style={[styles.ocrProgressCard, ocrReadStatus === "failed" && !ocrReportResolved && styles.ocrProgressCardFailed, (ocrReadStatus === "success" || ocrReportResolved) && styles.ocrProgressCardSuccess]}>
                 {ocrReadStatus === "reading" ? <ActivityIndicator size="small" color="#1F6F5B" /> : <MaterialIcons name={ocrReadStatus === "success" || ocrReportResolved ? "check-circle" : "error-outline"} size={20} color={ocrReadStatus === "success" || ocrReportResolved ? "#1F6F5B" : "#B42318"} />}
-                <View style={styles.ocrProgressCopy}><Text style={styles.ocrProgressTitle}>{ocrReadStatus === "reading" ? `กำลังอ่านภาพ · ครั้งที่ ${ocrReadAttempt}` : ocrReadStatus === "success" ? "อ่านชื่อสินค้าสำเร็จ" : ocrReportResolved ? "ยืนยันผล OCR ถูกต้องแล้ว" : `อ่านไม่สำเร็จ · ลองแล้ว ${ocrReadAttempt} ครั้ง`}</Text><Text style={styles.ocrProgressText}>{ocrReadStatus === "reading" ? "กำลังส่งภาพเดิมให้ระบบวิเคราะห์ โปรดรอสักครู่…" : ocrReadStatus === "success" ? "กำลังเปิดหน้าตรวจสอบชื่อสินค้า" : ocrReportResolved ? "ยกเลิกการรายงานแล้ว และจะไม่นำภาพนี้ส่งเป็นข้อผิดพลาด" : "กด “ลองอ่านซ้ำ” ในหน้าต่างแจ้งเตือนเพื่อใช้ภาพเดิมอีกครั้ง"}</Text>{ocrReadStatus === "failed" ? <Animated.View pointerEvents={ocrReportResolved ? "none" : "auto"} style={[styles.ocrReportPanel, { opacity: ocrReportTransition, transform: [{ translateY: ocrReportTransition.interpolate({ inputRange: [0, 1], outputRange: [-6, 0] }) }] }]}><Text style={styles.ocrCorrectedLabel}>ชื่อสินค้าที่ถูกต้องสำหรับอ้างอิง</Text><TextInput accessibilityLabel="ชื่อสินค้าที่ถูกต้องสำหรับรายงาน OCR" value={correctedOcrName} onChangeText={setCorrectedOcrName} placeholder="พิมพ์ชื่อที่ถูกต้องบนฉลาก" placeholderTextColor="#98A2B3" style={[styles.ocrCorrectedInput, correctedNameMatchesOcr && styles.ocrCorrectedInputWarning]} returnKeyType="done" />{correctedNameMatchesOcr ? <View style={styles.ocrDuplicateWarning}><MaterialIcons name="warning-amber" size={16} color="#B42318" /><Text style={styles.ocrDuplicateWarningText}>ชื่อนี้เหมือนกับผล OCR เดิม โปรดตรวจสอบและแก้ไขก่อนรายงาน</Text></View> : null}<Pressable accessibilityRole="button" accessibilityLabel="รายงานผลการอ่าน OCR ผิดพลาด" disabled={reportOcrErrorMutation.isPending || correctedNameMatchesOcr} onPress={() => void reportOcrError()} style={({ pressed }) => [styles.ocrReportButton, pressed && styles.pressed, (reportOcrErrorMutation.isPending || correctedNameMatchesOcr) && styles.disabledButton]}><MaterialIcons name="flag" size={15} color="#B42318" /><Text style={styles.ocrReportText}>{reportOcrErrorMutation.isPending ? "กำลังส่งรายงาน…" : correctedNameMatchesOcr ? "แก้ชื่อก่อนส่งรายงาน" : "รายงานผลการอ่านผิดพลาด"}</Text></Pressable><Pressable accessibilityRole="button" accessibilityLabel="ยืนยันว่าผล OCR ถูกต้องแล้ว" onPress={confirmOcrWasCorrect} style={({ pressed }) => [styles.ocrConfirmButton, pressed && styles.pressed]}><MaterialIcons name="verified" size={15} color="#1F6F5B" /><Text style={styles.ocrConfirmText}>ยืนยันว่าผล OCR ถูกต้องแล้ว</Text></Pressable></Animated.View> : null}{ocrReadStatus === "failed" && ocrReportResolved ? <Animated.View style={[styles.ocrResolvedRow, { opacity: ocrReportTransition.interpolate({ inputRange: [0, 1], outputRange: [1, 0] }) }]}><MaterialIcons name="check-circle" size={16} color="#1F6F5B" /><Text style={styles.ocrResolvedText}>ยกเลิกการรายงานข้อผิดพลาดแล้ว</Text><Pressable accessibilityRole="button" accessibilityLabel="ยกเลิกการยืนยันผล OCR" onPress={undoOcrConfirmation} style={({ pressed }) => [styles.ocrUndoButton, pressed && styles.pressed]}><MaterialIcons name="undo" size={15} color="#667085" /><Text style={styles.ocrUndoText}>ยกเลิกการยืนยัน</Text></Pressable></Animated.View> : null}</View>
+                <View style={styles.ocrProgressCopy}><Text style={styles.ocrProgressTitle}>{ocrReadStatus === "reading" ? `กำลังอ่านภาพ · ครั้งที่ ${ocrReadAttempt}` : ocrReadStatus === "success" ? "อ่านชื่อสินค้าสำเร็จ" : ocrReportResolved ? "ยืนยันผล OCR ถูกต้องแล้ว" : `อ่านไม่สำเร็จ · ลองแล้ว ${ocrReadAttempt} ครั้ง`}</Text><Text style={styles.ocrProgressText}>{ocrReadStatus === "reading" ? "กำลังส่งภาพเดิมให้ระบบวิเคราะห์ โปรดรอสักครู่…" : ocrReadStatus === "success" ? "กำลังเปิดหน้าตรวจสอบชื่อสินค้า" : ocrReportResolved ? "ยกเลิกการรายงานแล้ว และจะไม่นำภาพนี้ส่งเป็นข้อผิดพลาด" : "กด “ลองอ่านซ้ำ” ในหน้าต่างแจ้งเตือนเพื่อใช้ภาพเดิมอีกครั้ง"}</Text>{ocrReadStatus === "failed" ? <Animated.View pointerEvents={ocrReportResolved ? "none" : "auto"} style={[styles.ocrReportPanel, { opacity: ocrReportTransition, transform: [{ translateY: ocrReportTransition.interpolate({ inputRange: [0, 1], outputRange: [-6, 0] }) }] }]}><Text style={styles.ocrCorrectedLabel}>ชื่อสินค้าที่ถูกต้องสำหรับอ้างอิง</Text><TextInput accessibilityLabel="ชื่อสินค้าที่ถูกต้องสำหรับรายงาน OCR" value={correctedOcrName} onChangeText={setCorrectedOcrName} placeholder="พิมพ์ชื่อที่ถูกต้องบนฉลาก" placeholderTextColor="#98A2B3" style={[styles.ocrCorrectedInput, correctedNameMatchesOcr && styles.ocrCorrectedInputWarning]} returnKeyType="done" />{correctedNameMatchesOcr ? <View style={styles.ocrDuplicateWarning}><MaterialIcons name="warning-amber" size={16} color="#B42318" /><Text style={styles.ocrDuplicateWarningText}>ชื่อนี้เหมือนกับผล OCR เดิม โปรดตรวจสอบและแก้ไขก่อนรายงาน</Text></View> : null}<Pressable accessibilityRole="button" accessibilityLabel="รายงานผลการอ่าน OCR ผิดพลาด" disabled={isReportingOcr || correctedNameMatchesOcr} onPress={() => void reportOcrError()} style={({ pressed }) => [styles.ocrReportButton, pressed && styles.pressed, (isReportingOcr || correctedNameMatchesOcr) && styles.disabledButton]}><MaterialIcons name="flag" size={15} color="#B42318" /><Text style={styles.ocrReportText}>{isReportingOcr ? "กำลังบันทึก…" : correctedNameMatchesOcr ? "แก้ชื่อก่อนส่งรายงาน" : "รายงานผลการอ่านผิดพลาด"}</Text></Pressable><Pressable accessibilityRole="button" accessibilityLabel="ยืนยันว่าผล OCR ถูกต้องแล้ว" onPress={confirmOcrWasCorrect} style={({ pressed }) => [styles.ocrConfirmButton, pressed && styles.pressed]}><MaterialIcons name="verified" size={15} color="#1F6F5B" /><Text style={styles.ocrConfirmText}>ยืนยันว่าผล OCR ถูกต้องแล้ว</Text></Pressable></Animated.View> : null}{ocrReadStatus === "failed" && ocrReportResolved ? <Animated.View style={[styles.ocrResolvedRow, { opacity: ocrReportTransition.interpolate({ inputRange: [0, 1], outputRange: [1, 0] }) }]}><MaterialIcons name="check-circle" size={16} color="#1F6F5B" /><Text style={styles.ocrResolvedText}>ยกเลิกการรายงานข้อผิดพลาดแล้ว</Text><Pressable accessibilityRole="button" accessibilityLabel="ยกเลิกการยืนยันผล OCR" onPress={undoOcrConfirmation} style={({ pressed }) => [styles.ocrUndoButton, pressed && styles.pressed]}><MaterialIcons name="undo" size={15} color="#667085" /><Text style={styles.ocrUndoText}>ยกเลิกการยืนยัน</Text></Pressable></Animated.View> : null}</View>
               </View> : null}
             </View>
             <View style={styles.field}>

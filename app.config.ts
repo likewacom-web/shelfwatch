@@ -44,7 +44,7 @@ const env = {
 const config: ExpoConfig = {
   name: env.appName,
   slug: env.appSlug,
-  version: "1.0.0",
+  version: "1.1.0",
   runtimeVersion: {
     policy: "appVersion",
   },
@@ -75,6 +75,7 @@ const config: ExpoConfig = {
     edgeToEdgeEnabled: true,
     predictiveBackGestureEnabled: false,
     package: env.androidPackage,
+    versionCode: 10100,
     permissions: ["POST_NOTIFICATIONS"],
     intentFilters: [
       {

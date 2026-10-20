@@ -1,0 +1,78 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.12.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Type check and tests
+        run: |
+          pnpm exec tsc --noEmit
+          pnpm exec vitest run tests/ocr.test.ts tests/ocr-pipeline.test.ts tests/inventory.test.ts tests/inventory-backup.test.ts
+
+      - name: Generate native Android project
+        run: npx expo prebuild --platform android --no-install
+
+      - name: Use the app's own signing key
+        # Same key on every build, so new APKs install over the previous one without uninstalling.
+        run: |
+          cp signing/shelfwatch-release.keystore android/app/debug.keystore
+          sed -i 's/^org.gradle.jvmargs=.*/org.gradle.jvmargs=-Xmx6g -XX:MaxMetaspaceSize=1g/' android/gradle.properties
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build release APK
+        working-directory: android
+        run: ./gradlew assembleRelease --no-daemon
+
+      - name: Read version
+        id: version
+        run: |
+          VERSION=$(node -e "const s=require('fs').readFileSync('app.config.ts','utf8');console.log((s.match(/version: \"([^\"]+)\"/)||[])[1]||'0.0.0')")
+          echo "name=$VERSION" >> "$GITHUB_OUTPUT"
+          cp android/app/build/outputs/apk/release/app-release.apk "ShelfWatch-$VERSION-build$GITHUB_RUN_NUMBER.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ShelfWatch-apk
+          path: ShelfWatch-*.apk
+
+      - name: Publish release (download link for the phone)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.name }}-build${{ github.run_number }}
+          name: ShelfWatch ${{ steps.version.outputs.name }} (build ${{ github.run_number }})
+          body: เปิดหน้านี้บนมือถือ แล้วกดไฟล์ .apk ด้านล่างเพื่อดาวน์โหลดและติดตั้ง
+          files: ShelfWatch-*.apk
+          make_latest: true
