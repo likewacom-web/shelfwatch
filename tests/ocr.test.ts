@@ -21,7 +21,8 @@ describe("Thai product label OCR", () => {
   });
 
   it("rejects uncertain or non-text results", () => {
-    expect(acceptOcrProductName("นม", 0.2)).toBe("");
+    expect(acceptOcrProductName("นม", 0.05)).toBe("");
+    expect(acceptOcrProductName("นม", 0.2)).toBe("นม");
     expect(acceptOcrProductName("1234567890", 0.99)).toBe("");
   });
 

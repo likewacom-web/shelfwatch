@@ -11,8 +11,9 @@ export function normalizeOcrProductName(value: string): string {
 export function acceptOcrProductName(value: string, confidence: number): string {
   const normalized = normalizeOcrProductName(value);
   const hasLetters = /[A-Za-z\u0E00-\u0E7F]/.test(normalized);
-  // Small labels often produce a useful partial name with lower confidence; keep it for user review.
-  if (confidence < 0.3 || normalized.length < 2 || normalized.length > 120 || !hasLetters || NON_PRODUCT_PREFIX.test(normalized)) {
+  // The user always reviews the OCR result before it is saved, so only drop names the model
+  // itself marks as near-guesses. A strict cut-off here used to discard correct Thai names.
+  if (confidence < 0.1 || normalized.length < 2 || normalized.length > 120 || !hasLetters || NON_PRODUCT_PREFIX.test(normalized)) {
     return "";
   }
   return normalized;

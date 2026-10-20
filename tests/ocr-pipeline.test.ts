@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { clampOcrConfidence, mergeOcrLines, normalizeOcrDetectedText } from "../lib/ocr-pipeline";
+import { clampOcrConfidence, mergeOcrLines, normalizeOcrDetectedText, parseLlmJson } from "../lib/ocr-pipeline";
 
 describe("server OCR pipeline helpers", () => {
   it("normalizes and limits noisy multiline transcription", () => {
@@ -16,5 +16,18 @@ describe("server OCR pipeline helpers", () => {
     expect(clampOcrConfidence(1.4)).toBe(1);
     expect(clampOcrConfidence(-0.2)).toBe(0);
     expect(clampOcrConfidence("bad")).toBe(0);
+  });
+
+  it("parses LLM JSON even when wrapped in code fences or extra text", () => {
+    expect(parseLlmJson<{ productName: string }>('{"productName":"นมไทย"}')).toEqual({ productName: "นมไทย" });
+    expect(parseLlmJson<{ productName: string }>('```json\n{"productName":"นมไทย"}\n```')).toEqual({ productName: "นมไทย" });
+    expect(parseLlmJson<{ productName: string }>('ผลลัพธ์: {"productName":"ชาเขียว"} จบ')).toEqual({ productName: "ชาเขียว" });
+    expect(parseLlmJson<{ productName: string }>([{ type: "text", text: '{"productName":"กาแฟ"}' }])).toEqual({ productName: "กาแฟ" });
+  });
+
+  it("returns an empty object for truncated or missing JSON", () => {
+    expect(parseLlmJson('{"productName":"นม')).toEqual({});
+    expect(parseLlmJson(undefined)).toEqual({});
+    expect(parseLlmJson("")).toEqual({});
   });
 });

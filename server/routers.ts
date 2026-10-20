@@ -5,8 +5,10 @@ import { systemRouter } from "./_core/systemRouter";
 import { publicProcedure, router } from "./_core/trpc";
 import { z } from "zod";
 import { acceptOcrProductName, collectOcrProductCandidates } from "../lib/ocr";
-import { clampOcrConfidence, mergeOcrLines } from "../lib/ocr-pipeline";
+import { clampOcrConfidence, mergeOcrLines, parseLlmJson } from "../lib/ocr-pipeline";
 import { storagePut } from "./storage";
+
+const OCR_MODEL = "gemini-3-flash-preview";
 
 export const appRouter = router({
   system: systemRouter,
@@ -46,17 +48,19 @@ export const appRouter = router({
     detectYellowLabel: publicProcedure
       .input(z.object({ imageDataUrl: z.string().startsWith("data:image/").max(12_000_000) }))
       .mutation(async ({ input }) => {
+        // Gemini 3 "thinks" before answering and those tokens count toward max_tokens.
+        // The old 128-token limit was used up by thinking, so the box came back empty.
         const response = await invokeLLM({
-          model: "gemini-3-flash-preview",
+          model: OCR_MODEL,
           messages: [
-            { role: "system", content: "คุณเป็นระบบตรวจจับกรอบป้ายราคาสีเหลืองในภาพชั้นวางสินค้า ให้คืนกรอบของป้ายสีเหลืองที่มีข้อความชื่อสินค้าในพิกัด normalized 0 ถึง 1 เท่านั้น ห้ามเลือกบรรจุภัณฑ์หรือวัตถุสีเหลืองอื่น หากไม่พบให้คืน confidence ต่ำและกรอบเต็มภาพ" },
-            { role: "user", content: [{ type: "text", text: "ค้นหาป้ายชื่อหรือป้ายราคาสีเหลืองที่อยู่ใกล้ชั้นวางและมีข้อความสินค้า ให้ครอบรวมทั้งแถบชื่อสินค้าและเผื่อขอบเล็กน้อย แต่ไม่ต้องรวมสินค้าด้านบนหรือบาร์โค้ดที่อยู่นอกป้าย" }, { type: "image_url", image_url: { url: input.imageDataUrl, detail: "high" } }] },
+            { role: "system", content: "คุณเป็นระบบหากรอบข้อความชื่อสินค้าในภาพถ่ายชั้นวางหรือฉลากสินค้า ให้คืนกรอบในพิกัด normalized 0 ถึง 1 (x,y คือมุมซ้ายบน) ลำดับความสำคัญ: 1) ป้ายราคา/ป้ายชื่อสีเหลืองบนชั้นวางที่มีชื่อสินค้า 2) ถ้าไม่มีป้ายเหลือง ให้ใช้บริเวณข้อความชื่อสินค้าที่ใหญ่และชัดที่สุดบนฉลากหรือบรรจุภัณฑ์ ไม่ต้องรวมบาร์โค้ด ราคา หรือรูปภาพที่ไม่เกี่ยวข้อง หากไม่พบข้อความเลยให้คืนกรอบเต็มภาพและ confidence ต่ำ ตอบ JSON ตาม schema เท่านั้น" },
+            { role: "user", content: [{ type: "text", text: "หากรอบของชื่อสินค้าในภาพนี้ ให้ครอบทั้งบรรทัดชื่อสินค้าและเผื่อขอบเล็กน้อย" }, { type: "image_url", image_url: { url: input.imageDataUrl, detail: "high" } }] },
           ],
-          maxTokens: 128,
+          maxTokens: 2048,
           response_format: {
             type: "json_schema",
             json_schema: {
-              name: "yellow_label_box",
+              name: "product_name_box",
               strict: true,
               schema: {
                 type: "object",
@@ -73,9 +77,7 @@ export const appRouter = router({
             },
           },
         });
-        const content = response.choices[0]?.message?.content;
-        let parsed: { x?: number; y?: number; width?: number; height?: number; confidence?: number } = {};
-        try { parsed = typeof content === "string" ? (JSON.parse(content) as typeof parsed) : {}; } catch { parsed = {}; }
+        const parsed = parseLlmJson<{ x: number; y: number; width: number; height: number; confidence: number }>(response.choices[0]?.message?.content);
         const clamp = (value: number | undefined, fallback: number) => Math.max(0, Math.min(1, Number.isFinite(value) ? value as number : fallback));
         const x = clamp(parsed.x, 0);
         const y = clamp(parsed.y, 0);
@@ -86,73 +88,49 @@ export const appRouter = router({
     productLabel: publicProcedure
       .input(z.object({ imageDataUrl: z.string().startsWith("data:image/").max(12_000_000) }))
       .mutation(async ({ input }) => {
-        type TranscriptionResult = { fullText?: string; lines?: unknown; confidence?: unknown };
-        type ProductResult = { productName?: string; confidence?: unknown; productCandidates?: unknown };
-        const parseJson = <T,>(content: unknown): T => {
-          if (typeof content !== "string") return {} as T;
-          try { return JSON.parse(content) as T; } catch { return {} as T; }
-        };
+        type LabelResult = { lines: unknown; productName: string; confidence: unknown; productCandidates: unknown };
 
-        // รอบที่ 1: ทำ full-text detection แบบ document OCR ให้ได้ข้อความทุกบรรทัดก่อน
-        const transcriptionResponse = await invokeLLM({
-          model: "gemini-3-flash-preview",
+        // One vision call that transcribes the label and picks the product name together.
+        // The old version made two sequential calls with small token limits; Gemini's thinking
+        // tokens often used up the limit, so the JSON was cut off and the name came back empty.
+        const response = await invokeLLM({
+          model: OCR_MODEL,
           messages: [
-            { role: "system", content: "คุณเป็นระบบถอดข้อความจากภาพฉลากสินค้าไทยแบบ document text detection อ่านตัวอักษรทุกบรรทัดตามที่เห็นจริง ห้ามสรุป ห้ามเดา และห้ามตัดราคา วันหมดอายุ ปริมาณ หรือบาร์โค้ดออก เพราะข้อมูลทั้งหมดจะถูกส่งให้ขั้นตอนคัดชื่อสินค้าในภายหลัง รักษาลำดับบรรทัด ภาษาไทย วรรณยุกต์ และตัวการันต์ ตอบ JSON ตาม schema เท่านั้น" },
-            { role: "user", content: [{ type: "text", text: "ถอดข้อความทุกบรรทัดในภาพนี้จากบนลงล่าง ถ้าบรรทัดใดอ่านไม่ชัดให้ใส่เฉพาะส่วนที่เห็นจริง พร้อมคืน fullText และ lines" }, { type: "image_url", image_url: { url: input.imageDataUrl, detail: "high" } }] },
+            { role: "system", content: "คุณเป็นระบบอ่านชื่อสินค้าจากภาพฉลาก/ป้ายสินค้าไทย ขั้นแรกถอดข้อความทุกบรรทัดตามที่เห็นจริง (lines) รักษาสระ วรรณยุกต์ และตัวการันต์ ห้ามเดาข้อความที่มองไม่เห็น จากนั้นเลือกชื่อสินค้า (productName) = แบรนด์ + ชื่อ/รุ่น/รสชาติ ตามที่ปรากฏ เช่น 'นมจืด ไทย-เดนมาร์ก' หรือ 'มาม่า รสต้มยำกุ้ง' ห้ามใช้ราคา ปริมาณ น้ำหนัก หน่วย วันผลิต วันหมดอายุ เลขล็อต เลข อย. บาร์โค้ด หรือคำโฆษณาเป็นชื่อ ถ้าภาพมีภาษาอังกฤษให้คงตามที่เห็น productCandidates คือชื่อที่เป็นไปได้ไม่เกิน 5 แบบ เรียงจากมั่นใจมากไปน้อย (รวม productName เป็นตัวแรก) confidence คือความมั่นใจของ productName 0 ถึง 1 ถ้าไม่พบชื่อสินค้าเลยให้ productName เป็นสตริงว่าง ตอบ JSON ตาม schema เท่านั้น" },
+            { role: "user", content: [{ type: "text", text: "อ่านชื่อสินค้าจากภาพนี้" }, { type: "image_url", image_url: { url: input.imageDataUrl, detail: "high" } }] },
           ],
-          maxTokens: 768,
+          maxTokens: 4096,
           response_format: {
             type: "json_schema",
             json_schema: {
-              name: "thai_label_transcription",
+              name: "thai_product_label",
               strict: true,
               schema: {
                 type: "object",
                 properties: {
-                  fullText: { type: "string" },
-                  lines: { type: "array", items: { type: "string" }, maxItems: 80 },
-                  confidence: { type: "number" },
-                },
-                required: ["fullText", "lines", "confidence"],
-                additionalProperties: false,
-              },
-            },
-          },
-        });
-        const transcription = parseJson<TranscriptionResult>(transcriptionResponse.choices[0]?.message?.content);
-        const detectedText = mergeOcrLines(typeof transcription.fullText === "string" ? transcription.fullText : "", transcription.lines);
-        const transcriptionConfidence = clampOcrConfidence(transcription.confidence);
-
-        // รอบที่ 2: ใช้ภาพจริง + transcription เพื่อคัดชื่อสินค้า ลดการดึงราคา/วันหมดอายุเป็นชื่อ
-        const productResponse = await invokeLLM({
-          model: "gemini-3-flash-preview",
-          messages: [
-            { role: "system", content: "คุณเป็นผู้คัดชื่อสินค้าไทยจากผล document OCR แบบ Google Lens ให้เลือกเฉพาะชื่อสินค้า/แบรนด์ที่มีหลักฐานจากภาพหรือข้อความถอดได้ ห้ามแต่งชื่อใหม่ ห้ามใช้ราคา ปริมาณ หน่วย น้ำหนัก วันผลิต วันหมดอายุ เลขล็อต เลข อย. บาร์โค้ด หรือคำโฆษณาเป็นชื่อสินค้า หากข้อความถอดผิด ให้ตรวจเทียบกับภาพจริงและแก้เฉพาะตัวอักษรที่มีหลักฐาน ตอบ JSON ตาม schema เท่านั้น" },
-            { role: "user", content: [{ type: "text", text: `ผลถอดข้อความทุกบรรทัดจากรอบแรก:\n${detectedText || "(ไม่พบข้อความที่เชื่อถือได้)"}\n\nคัดชื่อสินค้า/แบรนด์ที่เป็นไปได้ไม่เกิน 5 แบบ เรียงจากมั่นใจมากไปน้อย ตรวจภาพจริงซ้ำ โดยเฉพาะสระ วรรณยุกต์ และตัวการันต์ คืน confidence ของชื่อที่เลือก ไม่ใช่ confidence ของการมองเห็นภาพ` }, { type: "image_url", image_url: { url: input.imageDataUrl, detail: "high" } }] },
-          ],
-          maxTokens: 512,
-          response_format: {
-            type: "json_schema",
-            json_schema: {
-              name: "thai_product_name_candidates",
-              strict: true,
-              schema: {
-                type: "object",
-                properties: {
+                  lines: { type: "array", items: { type: "string" }, maxItems: 40 },
                   productName: { type: "string" },
                   confidence: { type: "number" },
                   productCandidates: { type: "array", items: { type: "string" }, maxItems: 5 },
                 },
-                required: ["productName", "confidence", "productCandidates"],
+                required: ["lines", "productName", "confidence", "productCandidates"],
                 additionalProperties: false,
               },
             },
           },
         });
-        const product = parseJson<ProductResult>(productResponse.choices[0]?.message?.content);
-        const confidence = clampOcrConfidence(product.confidence) || transcriptionConfidence;
-        const candidates = collectOcrProductCandidates(product.productName ?? "", product.productCandidates, confidence);
-        return { productName: candidates[0] ?? "", productCandidates: candidates, detectedText, confidence, transcriptionConfidence };
+        const result = parseLlmJson<LabelResult>(response.choices[0]?.message?.content);
+        const detectedText = mergeOcrLines("", result.lines);
+        const productName = typeof result.productName === "string" ? result.productName : "";
+        // A missing confidence field must not throw away a name the model did return.
+        const rawConfidence = clampOcrConfidence(result.confidence);
+        const confidence = rawConfidence > 0 ? rawConfidence : productName ? 0.5 : 0;
+        let candidates = collectOcrProductCandidates(productName, result.productCandidates, confidence);
+        if (candidates.length === 0 && detectedText) {
+          // Fallback: offer the first readable transcribed lines so the user can pick one instead of retyping.
+          candidates = collectOcrProductCandidates("", detectedText.split("\n").slice(0, 5), 0.5);
+        }
+        return { productName: candidates[0] ?? "", productCandidates: candidates, detectedText, confidence, transcriptionConfidence: confidence };
       }),
     reportError: publicProcedure
       .input(z.object({ imageDataUrl: z.string().startsWith("data:image/").max(12_000_000), ocrText: z.string().max(120).default(""), correctedText: z.string().min(1).max(120) }))
@@ -170,21 +148,15 @@ export const appRouter = router({
       .input(z.object({ productName: z.string().min(1).max(120) }))
       .mutation(async ({ input }) => {
         const response = await invokeLLM({
-          model: "gemini-3-flash-preview",
+          model: OCR_MODEL,
           messages: [
             { role: "system", content: "คุณเป็นผู้ตรวจทานชื่อสินค้าไทยจากผล OCR ตอบเป็น JSON object เท่านั้น ห้ามแต่งชื่อสินค้าใหม่ ห้ามเปลี่ยนชื่อแบรนด์โดยไม่มีเหตุผล และห้ามแนะนำราคา วันหมดอายุ ปริมาณ เลขล็อต หรือคำโฆษณา ให้เสนอคำแก้ไขเฉพาะเมื่อมีความเป็นไปได้ว่า OCR อ่านพยัญชนะ สระ วรรณยุกต์ หรือการเว้นวรรคผิด หากข้อความถูกต้องแล้วให้คืน suggestions เป็นอาร์เรย์ว่าง" },
             { role: "user", content: `ตรวจทานผล OCR นี้: ${input.productName}\nเสนอคำแก้ไขภาษาไทยที่เป็นไปได้ไม่เกิน 3 รายการ เรียงจากน่าเชื่อถือที่สุด และต้องคงความหมายกับชื่อสินค้าเดิม` },
           ],
-          maxTokens: 256,
+          maxTokens: 2048,
           response_format: { type: "json_object" },
         });
-        const content = response.choices[0]?.message?.content;
-        let parsed: { suggestions?: unknown } = {};
-        try {
-          parsed = typeof content === "string" ? (JSON.parse(content) as { suggestions?: unknown }) : {};
-        } catch {
-          parsed = {};
-        }
+        const parsed = parseLlmJson<{ suggestions: unknown }>(response.choices[0]?.message?.content);
         const suggestions = Array.isArray(parsed.suggestions)
           ? [...new Set(parsed.suggestions.filter((value): value is string => typeof value === "string").map((value) => acceptOcrProductName(value, 1)).filter((value) => value && value !== input.productName.trim()))].slice(0, 3)
           : [];

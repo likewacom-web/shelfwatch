@@ -3,6 +3,7 @@ import { router, useLocalSearchParams } from "expo-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as ImagePicker from "expo-image-picker";
 import * as FileSystem from "expo-file-system/legacy";
+import * as ImageManipulator from "expo-image-manipulator";
 import { CameraView, useCameraPermissions } from "expo-camera";
 import Slider from "@react-native-community/slider";
 import { useAudioPlayer } from "expo-audio";
@@ -37,6 +38,19 @@ type OcrReadStatus = "idle" | "reading" | "failed" | "success";
 type ToastKind = "ocr" | "saved" | "info" | "warning";
 type ToastData = { message: string; kind: ToastKind };
 type SaveAction = "save" | "saveAndAdd" | "newLot";
+
+const OCR_REQUEST_TIMEOUT_MS = 60_000;
+
+/** Stop waiting for the server after a while so the screen never spins forever. */
+function withOcrTimeout<T>(promise: Promise<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("ocr-timeout")), OCR_REQUEST_TIMEOUT_MS);
+    promise.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (error) => { clearTimeout(timer); reject(error); },
+    );
+  });
+}
 
 function normalizeReportedOcrText(value: string): string {
   return value.trim().replace(/\s+/g, " ").toLocaleLowerCase();
@@ -435,12 +449,17 @@ export default function ProductFormScreen() {
   };
 
   const detectYellowLabel = async (asset: OcrAsset) => {
-    const base64 = asset.base64 ?? await FileSystem.readAsStringAsync(asset.uri, { encoding: FileSystem.EncodingType.Base64 });
-    if (!base64) throw new Error("missing-image-data");
-    const mimeType = asset.mimeType?.startsWith("image/") ? asset.mimeType : asset.uri.toLowerCase().endsWith(".png") ? "image/png" : "image/jpeg";
-    const result = await detectYellowLabelMutation.mutateAsync({ imageDataUrl: `data:${mimeType};base64,${base64}` });
-    if (result.confidence < 0.25) showToast("ระบบไม่มั่นใจกรอบป้าย ลองปรับกรอบด้วยตนเองได้");
-    return result;
+    try {
+      // Box detection only needs a preview-sized image; the box is returned in 0-1 coordinates.
+      const preview = await ImageManipulator.manipulateAsync(asset.uri, [{ resize: (asset.width ?? 0) >= (asset.height ?? 0) ? { width: 1280 } : { height: 1280 } }], { compress: 0.8, format: ImageManipulator.SaveFormat.JPEG, base64: true });
+      if (!preview.base64) throw new Error("missing-image-data");
+      const result = await withOcrTimeout(detectYellowLabelMutation.mutateAsync({ imageDataUrl: `data:image/jpeg;base64,${preview.base64}` }));
+      if (result.confidence < 0.25) showToast("ระบบไม่มั่นใจกรอบชื่อสินค้า ลองปรับกรอบด้วยตนเองได้");
+      return result;
+    } catch (error) {
+      showToast("หากรอบอัตโนมัติไม่สำเร็จ ลากกรอบเองได้เลย", "warning");
+      throw error;
+    }
   };
 
   const recordBoxDecision = (event: { eventType: "selection" | "finalize"; userChoice: "auto" | "manual"; confidence: number | null; suggestedBox: { x: number; y: number; width: number; height: number } | null; finalBox: { x: number; y: number; width: number; height: number } | null; note: string }) => {
@@ -453,7 +472,7 @@ export default function ProductFormScreen() {
     const base64 = asset.base64 ?? await FileSystem.readAsStringAsync(asset.uri, { encoding: FileSystem.EncodingType.Base64 });
     if (!base64) throw new Error("missing-image-data");
     const mimeType = asset.mimeType?.startsWith("image/") ? asset.mimeType : asset.uri.toLowerCase().endsWith(".png") ? "image/png" : "image/jpeg";
-    const response = await readLabelMutation.mutateAsync({ imageDataUrl: `data:${mimeType};base64,${base64}` });
+    const response = await withOcrTimeout(readLabelMutation.mutateAsync({ imageDataUrl: `data:${mimeType};base64,${base64}` }));
     if (response.productName) {
       showToast("ส่งภาพเข้า OCR สำเร็จ · ได้ผลการอ่านแล้ว", "ocr");
       await reviewOcrName(response.productName, response.productCandidates ?? []);
@@ -577,7 +596,9 @@ export default function ProductFormScreen() {
     if (!labelCameraRef.current || isReadingLabel) return;
     setIsReadingLabel(true);
     try {
-      const result = await labelCameraRef.current.takePictureAsync({ quality: 0.85, base64: true, exif: true });
+      // exif: false makes expo-camera rotate the pixels upright itself and skip the EXIF tag.
+      // With exif: true the photo stayed unrotated, then got rotated twice in the crop screen (sideways text).
+      const result = await labelCameraRef.current.takePictureAsync({ quality: 0.9, base64: false, exif: false });
       if (result) {
         closeLabelCamera();
         previousCorrectedOcrName.current = "";
@@ -594,7 +615,7 @@ export default function ProductFormScreen() {
   const chooseLabelImage = async () => {
     setIsReadingLabel(true);
     try {
-      const result = await ImagePicker.launchImageLibraryAsync({ allowsEditing: false, quality: 0.85, base64: true, mediaTypes: ["images"] });
+      const result = await ImagePicker.launchImageLibraryAsync({ allowsEditing: false, quality: 0.9, base64: false, mediaTypes: ["images"] });
       if (!result.canceled && result.assets[0]) {
         previousCorrectedOcrName.current = "";
         setCorrectedOcrName("");

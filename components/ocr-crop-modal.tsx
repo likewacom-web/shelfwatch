@@ -20,19 +20,22 @@ type OcrCropModalProps = {
 type WorkingAsset = { uri: string; width?: number; height?: number; exif?: Record<string, unknown> | null };
 type CropBox = { x: number; y: number; width: number; height: number };
 
-async function normalizeExifOrientation(asset: WorkingAsset): Promise<WorkingAsset> {
-  const orientation = Number(asset.exif?.Orientation ?? asset.exif?.orientation ?? 1);
-  const actions: ImageManipulator.Action[] = [];
-  if (orientation === 2) actions.push({ flip: ImageManipulator.FlipType.Horizontal });
-  if (orientation === 3) actions.push({ rotate: 180 });
-  if (orientation === 4) actions.push({ flip: ImageManipulator.FlipType.Vertical });
-  if (orientation === 5) actions.push({ flip: ImageManipulator.FlipType.Horizontal }, { rotate: 90 });
-  if (orientation === 6) actions.push({ rotate: 90 });
-  if (orientation === 7) actions.push({ flip: ImageManipulator.FlipType.Horizontal }, { rotate: 270 });
-  if (orientation === 8) actions.push({ rotate: 270 });
-  if (actions.length === 0) return asset;
-  const normalized = await ImageManipulator.manipulateAsync(asset.uri, actions, { compress: 0.9, format: ImageManipulator.SaveFormat.JPEG });
-  return { uri: normalized.uri, width: normalized.width, height: normalized.height };
+const MAX_WORKING_SIDE = 2400;
+const OCR_TARGET_WIDTH = 1600;
+
+/**
+ * Re-encode the photo so its pixels are upright and not oversized.
+ * expo-image-manipulator already applies EXIF orientation when it loads an image
+ * (Glide on Android, fixOrientation on iOS). The old code rotated again by hand,
+ * so labels shot in portrait came out sideways and OCR could not read them.
+ */
+async function prepareWorkingImage(asset: WorkingAsset): Promise<WorkingAsset> {
+  const upright = await ImageManipulator.manipulateAsync(asset.uri, [], { compress: 0.92, format: ImageManipulator.SaveFormat.JPEG });
+  const longSide = Math.max(upright.width, upright.height);
+  if (longSide <= MAX_WORKING_SIDE) return { uri: upright.uri, width: upright.width, height: upright.height };
+  const resize = upright.width >= upright.height ? { width: MAX_WORKING_SIDE } : { height: MAX_WORKING_SIDE };
+  const scaled = await ImageManipulator.manipulateAsync(upright.uri, [{ resize }], { compress: 0.92, format: ImageManipulator.SaveFormat.JPEG });
+  return { uri: scaled.uri, width: scaled.width, height: scaled.height };
 }
 
 function clampCrop(rect: CropRect, bounds: CropBounds): CropRect {
@@ -99,10 +102,11 @@ export function OcrCropModal({ visible, asset, onCancel, onConfirm, onAutoCrop, 
     setAutoCropConfidence(null);
     setSuggestedBox(null);
     setManualNote("");
-    setHasRotation(Number(asset.exif?.Orientation ?? asset.exif?.orientation ?? 1) !== 1);
+    setHasRotation(false);
     setIsProcessing(true);
-    void normalizeExifOrientation(asset).then((normalized) => {
-      setWorkingAsset(normalized);
+    void prepareWorkingImage(asset).then((prepared) => {
+      setOriginalAsset(prepared);
+      setWorkingAsset(prepared);
       setIsProcessing(false);
     }).catch(() => setIsProcessing(false));
   }, [asset, visible]);
@@ -204,11 +208,13 @@ export function OcrCropModal({ visible, asset, onCancel, onConfirm, onAutoCrop, 
       const originY = Math.max(0, Math.round((crop.top - imageSize.top) / imageSize.scale));
       const width = Math.max(1, Math.min((workingAsset.width || 1) - originX, Math.round(crop.width / imageSize.scale)));
       const height = Math.max(1, Math.min((workingAsset.height || 1) - originY, Math.round(crop.height / imageSize.scale)));
-      const cropped = await ImageManipulator.manipulateAsync(workingAsset.uri, [{ crop: { originX, originY, width, height } }], { compress: 1, format: ImageManipulator.SaveFormat.JPEG });
-      const targetWidth = Math.min(1800, Math.max(cropped.width, 1200));
-      const enhanced = cropped.width < targetWidth
-        ? await ImageManipulator.manipulateAsync(cropped.uri, [{ resize: { width: targetWidth } }], { compress: 1, format: ImageManipulator.SaveFormat.JPEG, base64: true })
-        : await ImageManipulator.manipulateAsync(cropped.uri, [], { compress: 1, format: ImageManipulator.SaveFormat.JPEG, base64: true });
+      // Crop and scale to a fixed width in one pass: small labels are enlarged so Thai
+      // vowels and tone marks stay legible, large crops are reduced so the upload stays small and fast.
+      const enhanced = await ImageManipulator.manipulateAsync(
+        workingAsset.uri,
+        [{ crop: { originX, originY, width, height } }, { resize: { width: OCR_TARGET_WIDTH } }],
+        { compress: 0.88, format: ImageManipulator.SaveFormat.JPEG, base64: true },
+      );
       onBoxDecision?.({ eventType: "finalize", userChoice: choice, confidence: autoCropConfidence, suggestedBox, finalBox, note: choice === "manual" ? manualNote : "" });
       await onConfirm({ uri: enhanced.uri, base64: enhanced.base64 });
     } finally {
@@ -232,6 +238,8 @@ export function OcrCropModal({ visible, asset, onCancel, onConfirm, onAutoCrop, 
       setAutoCropDetected(true);
       setAutoCropConfidence(Math.max(0, Math.min(1, detected.confidence)));
       setSuggestedBox({ x: detected.x, y: detected.y, width: detected.width, height: detected.height });
+    } catch {
+      // Detection failed (network/timeout); the user can still drag the box manually.
     } finally {
       setIsAutoCropping(false);
     }
@@ -272,8 +280,8 @@ export function OcrCropModal({ visible, asset, onCancel, onConfirm, onAutoCrop, 
         </View>
         <View style={styles.footer}>
           <Text style={styles.tip}>{autoCropDetected ? `กรอบอัตโนมัติ · ความมั่นใจ ${Math.round((autoCropConfidence ?? 0) * 100)}% · ตรวจสอบกรอบก่อนส่ง OCR` : "แนะนำ: ให้ตัวอักษรชื่อสินค้าอยู่ภายในกรอบและมีขนาดใหญ่ที่สุด"}</Text>
-          {onAutoCrop ? <Pressable accessibilityRole="button" accessibilityLabel="ตรวจจับกรอบป้ายสีเหลืองอัตโนมัติ" onPress={() => void handleAutoCrop()} disabled={!workingAsset || isProcessing || isAutoCropping} style={({ pressed }) => [styles.autoCropButton, pressed && styles.pressed, (!workingAsset || isProcessing || isAutoCropping) && styles.disabled]}>
-            {isAutoCropping ? <ActivityIndicator color="#1F6F5B" /> : <Text style={styles.autoCropText}>ครอบป้ายสีเหลืองอัตโนมัติ</Text>}
+          {onAutoCrop ? <Pressable accessibilityRole="button" accessibilityLabel="ตรวจจับกรอบชื่อสินค้าอัตโนมัติ" onPress={() => void handleAutoCrop()} disabled={!workingAsset || isProcessing || isAutoCropping} style={({ pressed }) => [styles.autoCropButton, pressed && styles.pressed, (!workingAsset || isProcessing || isAutoCropping) && styles.disabled]}>
+            {isAutoCropping ? <ActivityIndicator color="#1F6F5B" /> : <Text style={styles.autoCropText}>หากรอบชื่อสินค้าอัตโนมัติ</Text>}
           </Pressable> : null}
           {suggestedBox && !autoCropDetected ? <View style={styles.notePanel}><Text style={styles.noteLabel}>หมายเหตุสาเหตุที่ต้องปรับกรอบเอง (ไม่บังคับ)</Text><TextInput value={manualNote} onChangeText={(value) => setManualNote(value.slice(0, 240))} maxLength={240} multiline numberOfLines={2} placeholder="เช่น กรอบไม่ครอบชื่อสินค้า หรือเลือกป้ายผิด" placeholderTextColor="#98A2B3" style={styles.noteInput} accessibilityLabel="หมายเหตุสาเหตุที่ปรับกรอบเอง" /><Text style={styles.noteCount}>{manualNote.length}/240</Text></View> : null}
           {autoCropDetected ? <View style={styles.autoChoiceRow}><Pressable accessibilityRole="button" accessibilityLabel="ใช้กรอบอัตโนมัติส่งเข้า OCR" onPress={() => void handleConfirm("auto")} disabled={!crop || isProcessing || isAutoCropping} style={({ pressed }) => [styles.confirmButton, styles.choiceButton, pressed && styles.pressed, (!crop || isProcessing || isAutoCropping) && styles.disabled]}><Text style={styles.confirmText}>ใช้กรอบอัตโนมัติ</Text></Pressable><Pressable accessibilityRole="button" accessibilityLabel="ปรับกรอบเองก่อนส่ง OCR" onPress={() => { onBoxDecision?.({ eventType: "selection", userChoice: "manual", confidence: autoCropConfidence, suggestedBox, finalBox: null, note: "" }); setAutoCropDetected(false); }} disabled={isProcessing || isAutoCropping} style={({ pressed }) => [styles.adjustButton, pressed && styles.pressed, (isProcessing || isAutoCropping) && styles.disabled]}><Text style={styles.adjustText}>ปรับกรอบเอง</Text></Pressable></View> : <Pressable accessibilityRole="button" accessibilityLabel="ยืนยันการครอบภาพเพื่ออ่าน OCR" onPress={() => void handleConfirm("manual")} disabled={!crop || isProcessing} style={({ pressed }) => [styles.confirmButton, pressed && styles.pressed, (!crop || isProcessing) && styles.disabled]}>
