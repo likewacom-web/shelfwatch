@@ -22,7 +22,14 @@ export const GEMINI_MODELS: ModelOption[] = [
   { model: "gemini-flash-latest", thinking: { thinkingBudget: 0 } },
   { model: "gemini-2.5-flash-lite" },
 ];
-const REQUEST_TIMEOUT_MS = 30_000;
+const REQUEST_TIMEOUT_MS = 15_000;
+const WORKING_MODEL_KEY = "shelfwatch.geminiWorkingModel";
+
+// Short log of the last request (model, result, seconds) so failures can be diagnosed from the app.
+let lastTrace: string[] = [];
+export function getLastGeminiTrace(): string {
+  return lastTrace.join(" → ");
+}
 
 export class GeminiError extends Error {
   constructor(public code: "no-key" | "bad-key" | "quota" | "network" | "timeout" | "server", message: string) {
@@ -78,6 +85,25 @@ type GeminiSchema = Record<string, unknown>;
 type GeminiRequest = { system: string; prompt: string; imageBase64?: string; mimeType?: string; schema: GeminiSchema; maxOutputTokens?: number };
 
 let workingModel: ModelOption | null = null;
+let workingModelLoaded = false;
+
+async function loadWorkingModel(): Promise<void> {
+  if (workingModelLoaded) return;
+  workingModelLoaded = true;
+  try {
+    const raw = await AsyncStorage.getItem(WORKING_MODEL_KEY);
+    const saved = raw ? (JSON.parse(raw) as ModelOption) : null;
+    if (saved && GEMINI_MODELS.some((m) => m.model === saved.model)) workingModel = saved;
+  } catch {
+    // ignore
+  }
+}
+
+function rememberWorkingModel(option: ModelOption) {
+  const changed = workingModel?.model !== option.model || JSON.stringify(workingModel?.thinking) !== JSON.stringify(option.thinking);
+  workingModel = option;
+  if (changed) void AsyncStorage.setItem(WORKING_MODEL_KEY, JSON.stringify(option)).catch(() => undefined);
+}
 
 async function postWithTimeout(url: string, body: unknown): Promise<Response> {
   const controller = new AbortController();
@@ -104,27 +130,49 @@ async function callGeminiJson<T extends object>(request: GeminiRequest, apiKeyOv
     contents: [{ role: "user", parts }],
     generationConfig: {
       temperature: 0.1,
-      // Large limit on purpose: newer Flash models spend tokens "thinking" before answering.
-      maxOutputTokens: request.maxOutputTokens ?? 8192,
+      // Small limit: the answer is a few words. A big limit let the model get stuck repeating
+      // itself for 30+ seconds (the "AI ตอบช้าเกินไป" error).
+      maxOutputTokens: request.maxOutputTokens ?? 512,
       responseMimeType: "application/json",
       responseSchema: request.schema,
     },
   };
 
+  await loadWorkingModel();
   const models = workingModel ? [workingModel, ...GEMINI_MODELS.filter((m) => m.model !== workingModel?.model)] : GEMINI_MODELS;
   let lastError: GeminiError = new GeminiError("server", "no model available");
+  lastTrace = [];
+  const sizeKb = request.imageBase64 ? Math.round((request.imageBase64.length * 0.75) / 1024) : 0;
+  if (sizeKb) lastTrace.push(`รูป ${sizeKb} KB`);
   for (const option of models) {
     // A model that rejects the thinking setting is retried once without it.
     for (const thinking of option.thinking ? [option.thinking, undefined] : [undefined]) {
-      const requestBody = thinking ? { ...body, generationConfig: { ...body.generationConfig, thinkingConfig: thinking } } : body;
-      const response = await postWithTimeout(`${GEMINI_ENDPOINT}/${option.model}:generateContent?key=${encodeURIComponent(apiKey)}`, requestBody);
+      // If thinking could not be switched off, the model needs room to think before it answers.
+      const thinkingStillOn = option.thinking && !thinking;
+      const generationConfig = { ...body.generationConfig, ...(thinking ? { thinkingConfig: thinking } : {}), ...(thinkingStillOn ? { maxOutputTokens: 4096 } : {}) };
+      const requestBody = { ...body, generationConfig };
+      const startedAt = Date.now();
+      const seconds = () => ((Date.now() - startedAt) / 1000).toFixed(1);
+      let response: Response;
+      try {
+        response = await postWithTimeout(`${GEMINI_ENDPOINT}/${option.model}:generateContent?key=${encodeURIComponent(apiKey)}`, requestBody);
+      } catch (error) {
+        const geminiError = error instanceof GeminiError ? error : new GeminiError("network", String(error));
+        lastTrace.push(`${option.model} ${geminiError.code} ${seconds()}s`);
+        lastError = geminiError;
+        if (geminiError.code === "network") throw geminiError; // no internet: other models won't help
+        break; // timeout: try the next (faster) model
+      }
       if (response.ok) {
-        workingModel = { model: option.model, thinking };
-        const json = (await response.json()) as { candidates?: { content?: { parts?: { text?: string; thought?: boolean }[] } }[] };
-        const text = (json.candidates?.[0]?.content?.parts ?? []).filter((part) => !part.thought).map((part) => part.text ?? "").join("");
+        const json = (await response.json()) as { candidates?: { finishReason?: string; content?: { parts?: { text?: string; thought?: boolean }[] } }[] };
+        const candidate = json.candidates?.[0];
+        const text = (candidate?.content?.parts ?? []).filter((part) => !part.thought).map((part) => part.text ?? "").join("");
+        lastTrace.push(`${option.model} OK ${seconds()}s${candidate?.finishReason && candidate.finishReason !== "STOP" ? ` (${candidate.finishReason})` : ""}`);
+        rememberWorkingModel({ model: option.model, thinking });
         return parseLlmJson<T>(text);
       }
       const errorText = await response.text().catch(() => "");
+      lastTrace.push(`${option.model} HTTP ${response.status} ${seconds()}s`);
       if (response.status === 400 && /API key not valid|API_KEY_INVALID/i.test(errorText)) throw new GeminiError("bad-key", errorText);
       if (response.status === 401 || response.status === 403) throw new GeminiError("bad-key", errorText);
       if (response.status === 400 && thinking && /thinking/i.test(errorText)) continue;
@@ -174,7 +222,7 @@ export async function readProductLabelImage(imageBase64: string, mimeType = "ima
       properties: {
         productName: { type: "STRING" },
         confidence: { type: "NUMBER" },
-        productCandidates: { type: "ARRAY", items: { type: "STRING" } },
+        productCandidates: { type: "ARRAY", items: { type: "STRING" }, maxItems: 3 },
       },
       required: ["productName", "confidence", "productCandidates"],
       propertyOrdering: ["productName", "confidence", "productCandidates"],
@@ -192,7 +240,7 @@ export async function suggestNameCorrections(productName: string): Promise<strin
     system: "คุณเป็นผู้ตรวจทานชื่อสินค้าไทยจากผล OCR ห้ามแต่งชื่อสินค้าใหม่ ห้ามเปลี่ยนชื่อแบรนด์โดยไม่มีเหตุผล และห้ามแนะนำราคา วันหมดอายุ ปริมาณ เลขล็อต หรือคำโฆษณา ให้เสนอคำแก้ไขเฉพาะเมื่อมีความเป็นไปได้ว่า OCR อ่านพยัญชนะ สระ วรรณยุกต์ หรือการเว้นวรรคผิด หากข้อความถูกต้องแล้วให้คืน suggestions เป็นอาร์เรย์ว่าง",
     prompt: `ตรวจทานผล OCR นี้: ${productName}\nเสนอคำแก้ไขภาษาไทยที่เป็นไปได้ไม่เกิน 3 รายการ เรียงจากน่าเชื่อถือที่สุด และต้องคงความหมายกับชื่อสินค้าเดิม`,
     schema: { type: "OBJECT", properties: { suggestions: { type: "ARRAY", items: { type: "STRING" } } }, required: ["suggestions"] },
-    maxOutputTokens: 4096,
+    maxOutputTokens: 512,
   });
   const values = Array.isArray(parsed.suggestions) ? parsed.suggestions : [];
   return collectOcrProductCandidates("", values, 1).filter((value) => value !== productName.trim()).slice(0, 3);
@@ -204,7 +252,7 @@ export async function testGeminiApiKey(apiKey: string): Promise<void> {
     system: "ตอบ JSON เท่านั้น",
     prompt: "ตอบ ok เป็น true",
     schema: { type: "OBJECT", properties: { ok: { type: "BOOLEAN" } }, required: ["ok"] },
-    maxOutputTokens: 1024,
+    maxOutputTokens: 64,
   }, apiKey.trim());
 }
 

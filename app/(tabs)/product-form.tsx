@@ -15,7 +15,7 @@ import { computeGuideCrop, type Rect } from "@/lib/ocr-guide-crop";
 import { ProductFlowStepper } from "@/components/product-flow-stepper";
 import { useInventory } from "@/lib/inventory-context";
 import { persistProductImage } from "@/lib/product-image";
-import { GeminiError, describeGeminiError, detectProductNameBox, getGeminiApiKey, readProductLabelImage, saveOcrReport } from "@/lib/gemini-ocr";
+import { GeminiError, describeGeminiError, detectProductNameBox, getGeminiApiKey, getLastGeminiTrace, readProductLabelImage, saveOcrReport } from "@/lib/gemini-ocr";
 import { calculateExpiryDate, createISODateFromParts, findProductAtPosition, findProductByCode, formatDateParts, getDatePartsForInput, findDuplicateBarcode, getNextAvailableItemNumber, getNextBatchNumber, getProductCategories, getProductGradeLabel, getProductGradeTheme, getProductLots, normalizeProductCategory, type DateInputParts, type Product, type ProductDateType, type ProductGrade } from "@/lib/inventory";
 
 type FormValues = {
@@ -40,7 +40,7 @@ type ToastKind = "ocr" | "saved" | "info" | "warning";
 type ToastData = { message: string; kind: ToastKind };
 type SaveAction = "save" | "saveAndAdd" | "newLot";
 
-const OCR_REQUEST_TIMEOUT_MS = 60_000;
+const OCR_REQUEST_TIMEOUT_MS = 75_000;
 
 /** Stop waiting for the server after a while so the screen never spins forever. */
 function withOcrTimeout<T>(promise: Promise<T>): Promise<T> {
@@ -472,12 +472,24 @@ export default function ProductFormScreen() {
     void event;
   };
 
-  const processProductLabelAsset = async (asset: OcrAsset) => {
+  const readAssetOnce = async (asset: OcrAsset) => {
     const base64 = asset.base64 ?? await FileSystem.readAsStringAsync(asset.uri, { encoding: FileSystem.EncodingType.Base64 });
     if (!base64) throw new Error("missing-image-data");
     const mimeType = asset.mimeType?.startsWith("image/") ? asset.mimeType : asset.uri.toLowerCase().endsWith(".png") ? "image/png" : "image/jpeg";
+    return withOcrTimeout(readProductLabelImage(base64, mimeType));
+  };
+
+  const processProductLabelAsset = async (asset: OcrAsset, wideFallback?: () => Promise<OcrAsset | null>) => {
     const startedAt = Date.now();
-    const response = await withOcrTimeout(readProductLabelImage(base64, mimeType));
+    let response = await readAssetOnce(asset);
+    if (!response.productName && wideFallback) {
+      // The guide-frame crop may have cut the name off: read the whole photo once more.
+      const wide = await wideFallback();
+      if (wide) {
+        setLastOcrAsset(wide);
+        response = await readAssetOnce(wide);
+      }
+    }
     if (response.productName) {
       showToast(`อ่านชื่อสินค้าเสร็จใน ${((Date.now() - startedAt) / 1000).toFixed(1)} วินาที`, "ocr");
       await reviewOcrName(response.productName, response.productCandidates ?? []);
@@ -503,10 +515,12 @@ export default function ProductFormScreen() {
     setLastOcrAsset(asset);
     setOcrReportResolved(false);
     setOcrReadStatus("failed");
-    Alert.alert(reason ? "อ่านชื่อสินค้าไม่สำเร็จ" : "อ่านชื่อสินค้าไม่ชัด", reason ?? "ระบบยังอ่านข้อความจากภาพเดิมไม่ได้ ลองอ่านซ้ำได้ทันที หรือครอบภาพใหม่ให้เห็นชื่อสินค้าใหญ่ขึ้น", [
+    const trace = getLastGeminiTrace();
+    const message = (reason ?? "AI ไม่เห็นชื่อสินค้าในภาพนี้ ลองถ่ายใหม่ให้ชื่ออยู่ในกรอบ หรือครอบภาพเฉพาะชื่อ") + (trace ? `\n\nรายละเอียด: ${trace}` : "");
+    // Android shows at most 3 buttons in an alert.
+    Alert.alert(reason ? "อ่านชื่อสินค้าไม่สำเร็จ" : "อ่านชื่อสินค้าไม่ชัด", message, [
       { text: "กรอกชื่อเอง", style: "cancel" },
-      { text: "ถ่าย/เลือกภาพใหม่", onPress: () => void readProductLabel() },
-      { text: "ครอบภาพก่อนอ่านซ้ำ", onPress: () => setOcrCropAsset(ocrFullPhotoRef.current ?? asset) },
+      { text: "ครอบภาพเอง", onPress: () => setOcrCropAsset(ocrFullPhotoRef.current ?? asset) },
       { text: "ลองอ่านซ้ำ", onPress: () => void retryLastOcrRead() },
     ]);
   };
@@ -634,11 +648,15 @@ export default function ProductFormScreen() {
         const crop = computeGuideCrop(result.width, result.height, screen ?? { x: 0, y: 0, width: 0, height: 0 }, frame);
         const small = await ImageManipulator.manipulateAsync(
           result.uri,
-          [{ crop: { originX: crop.x, originY: crop.y, width: crop.width, height: crop.height } }, { resize: { width: Math.min(1024, crop.width) } }],
+          [{ crop: { originX: crop.x, originY: crop.y, width: crop.width, height: crop.height } }, { resize: { width: Math.min(1280, crop.width) } }],
           { compress: 0.8, format: ImageManipulator.SaveFormat.JPEG, base64: true },
         );
         ocrFullPhotoRef.current = result;
-        await confirmCroppedLabel({ uri: small.uri, base64: small.base64 });
+        const wholePhoto = async () => {
+          const wide = await ImageManipulator.manipulateAsync(result.uri, [{ resize: result.width >= result.height ? { width: 1600 } : { height: 1600 } }], { compress: 0.8, format: ImageManipulator.SaveFormat.JPEG, base64: true });
+          return { uri: wide.uri, base64: wide.base64 };
+        };
+        await confirmCroppedLabel({ uri: small.uri, base64: small.base64 }, wholePhoto);
       }
     } catch {
       Alert.alert("ถ่ายภาพไม่สำเร็จ", "ลองจัดฉลากให้อยู่ในกรอบอีกครั้ง แล้วกดถ่ายใหม่");
@@ -671,7 +689,7 @@ export default function ProductFormScreen() {
     }
   };
 
-  const confirmCroppedLabel = async (asset: { uri: string; base64?: string }) => {
+  const confirmCroppedLabel = async (asset: { uri: string; base64?: string }, wideFallback?: () => Promise<OcrAsset | null>) => {
     setOcrCropAsset(null);
     previousCorrectedOcrName.current = "";
     setCorrectedOcrName("");
@@ -680,7 +698,7 @@ export default function ProductFormScreen() {
     setOcrReadStatus("reading");
     setIsReadingLabel(true);
     try {
-      const succeeded = await processProductLabelAsset(asset);
+      const succeeded = await processProductLabelAsset(asset, wideFallback);
       if (succeeded) {
         setLastOcrAsset(null);
         setOcrReadStatus("success");
