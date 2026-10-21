@@ -7,22 +7,53 @@ import * as SecureStore from "expo-secure-store";
 import { Platform } from "react-native";
 
 import { collectOcrProductCandidates } from "@/lib/ocr";
+import { rankFlashModels } from "@/lib/gemini-models";
 import { clampOcrConfidence, parseLlmJson } from "@/lib/ocr-pipeline";
 
 const API_KEY_STORAGE_KEY = "shelfwatch.geminiApiKey";
 const OCR_REPORTS_KEY = "shelfwatch.ocrReports";
 const GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models";
-// Tried in order, fastest first. Reading a label does not need the model to "think", so thinking
-// is switched off where the model allows it (that alone saves several seconds per photo).
-// "-latest" aliases are fallbacks in case a pinned model is unavailable for this key.
+// Google retires model versions over time (gemini-2.5-flash already returns 404), so the app
+// asks the API which Flash models this key can use instead of relying on a fixed list.
 type ModelOption = { model: string; thinking?: Record<string, unknown> };
-export const GEMINI_MODELS: ModelOption[] = [
-  { model: "gemini-2.5-flash", thinking: { thinkingBudget: 0 } },
-  { model: "gemini-flash-lite-latest", thinking: { thinkingBudget: 0 } },
-  { model: "gemini-flash-latest", thinking: { thinkingBudget: 0 } },
-  { model: "gemini-2.5-flash-lite" },
-];
+const FALLBACK_MODELS = ["gemini-flash-lite-latest", "gemini-flash-latest"];
+const MODEL_LIST_KEY = "shelfwatch.geminiModelList";
+const MODEL_LIST_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+// Ways to switch thinking off, tried in order until the model accepts one (Gemini 3 uses
+// thinkingLevel, Gemini 2.5 uses thinkingBudget, some models accept neither).
+const THINKING_LADDER: (Record<string, unknown> | undefined)[] = [{ thinkingLevel: "minimal" }, { thinkingBudget: 0 }, undefined];
+
+async function getCandidateModels(apiKey: string): Promise<string[]> {
+  try {
+    const cached = await AsyncStorage.getItem(MODEL_LIST_KEY);
+    if (cached) {
+      const parsed = JSON.parse(cached) as { at: number; models: string[] };
+      if (Date.now() - parsed.at < MODEL_LIST_MAX_AGE_MS && parsed.models.length > 0) return parsed.models;
+    }
+  } catch {
+    // ignore cache problems
+  }
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    const response = await fetch(`${GEMINI_ENDPOINT}?pageSize=1000&key=${encodeURIComponent(apiKey)}`, { signal: controller.signal });
+    clearTimeout(timer);
+    if (response.ok) {
+      const json = (await response.json()) as { models?: { name?: string; supportedGenerationMethods?: string[] }[] };
+      const names = (json.models ?? []).filter((m) => m.supportedGenerationMethods?.includes("generateContent")).map((m) => m.name ?? "");
+      const ranked = [...rankFlashModels(names).slice(0, 3), ...FALLBACK_MODELS];
+      const models = [...new Set(ranked)];
+      void AsyncStorage.setItem(MODEL_LIST_KEY, JSON.stringify({ at: Date.now(), models })).catch(() => undefined);
+      return models;
+    }
+  } catch {
+    // fall back to aliases
+  }
+  return FALLBACK_MODELS;
+}
+
 const REQUEST_TIMEOUT_MS = 15_000;
+const WORKING_MODEL_VERSION = 2;
 const WORKING_MODEL_KEY = "shelfwatch.geminiWorkingModel";
 
 // Short log of the last request (model, result, seconds) so failures can be diagnosed from the app.
@@ -81,8 +112,7 @@ export function maskApiKey(key: string): string {
 
 // ---------- Core request ----------
 
-type GeminiSchema = Record<string, unknown>;
-type GeminiRequest = { system: string; prompt: string; imageBase64?: string; mimeType?: string; schema: GeminiSchema; maxOutputTokens?: number };
+type GeminiRequest = { system: string; prompt: string; imageBase64?: string; mimeType?: string; jsonShape: string; maxOutputTokens?: number };
 
 let workingModel: ModelOption | null = null;
 let workingModelLoaded = false;
@@ -93,16 +123,21 @@ async function loadWorkingModel(): Promise<void> {
   try {
     const raw = await AsyncStorage.getItem(WORKING_MODEL_KEY);
     const saved = raw ? (JSON.parse(raw) as ModelOption) : null;
-    if (saved && GEMINI_MODELS.some((m) => m.model === saved.model)) workingModel = saved;
+    if (saved && (saved as { v?: number }).v === WORKING_MODEL_VERSION) workingModel = saved;
   } catch {
     // ignore
   }
 }
 
+function forgetWorkingModel() {
+  workingModel = null;
+  void AsyncStorage.removeItem(WORKING_MODEL_KEY).catch(() => undefined);
+}
+
 function rememberWorkingModel(option: ModelOption) {
   const changed = workingModel?.model !== option.model || JSON.stringify(workingModel?.thinking) !== JSON.stringify(option.thinking);
   workingModel = option;
-  if (changed) void AsyncStorage.setItem(WORKING_MODEL_KEY, JSON.stringify(option)).catch(() => undefined);
+  if (changed) void AsyncStorage.setItem(WORKING_MODEL_KEY, JSON.stringify({ ...option, v: WORKING_MODEL_VERSION })).catch(() => undefined);
 }
 
 async function postWithTimeout(url: string, body: unknown): Promise<Response> {
@@ -125,43 +160,47 @@ async function callGeminiJson<T extends object>(request: GeminiRequest, apiKeyOv
   const parts: Record<string, unknown>[] = [];
   if (request.imageBase64) parts.push({ inline_data: { mime_type: request.mimeType ?? "image/jpeg", data: request.imageBase64 } });
   parts.push({ text: request.prompt });
+  // No responseSchema: some newer models reject parts of it (HTTP 400). The JSON shape is
+  // described in the prompt instead and parsed leniently.
   const body = {
-    system_instruction: { parts: [{ text: request.system }] },
+    system_instruction: { parts: [{ text: `${request.system}\n\nตอบเป็น JSON อย่างเดียวในรูปแบบ: ${request.jsonShape}` }] },
     contents: [{ role: "user", parts }],
     generationConfig: {
       temperature: 0.1,
-      // Small limit: the answer is a few words. A big limit let the model get stuck repeating
-      // itself for 30+ seconds (the "AI ตอบช้าเกินไป" error).
+      // Small limit: the answer is a few words, and a big limit let a model loop for 30+ seconds.
       maxOutputTokens: request.maxOutputTokens ?? 512,
       responseMimeType: "application/json",
-      responseSchema: request.schema,
     },
   };
 
   await loadWorkingModel();
-  const models = workingModel ? [workingModel, ...GEMINI_MODELS.filter((m) => m.model !== workingModel?.model)] : GEMINI_MODELS;
-  let lastError: GeminiError = new GeminiError("server", "no model available");
   lastTrace = [];
   const sizeKb = request.imageBase64 ? Math.round((request.imageBase64.length * 0.75) / 1024) : 0;
   if (sizeKb) lastTrace.push(`รูป ${sizeKb} KB`);
-  for (const option of models) {
-    // A model that rejects the thinking setting is retried once without it.
-    for (const thinking of option.thinking ? [option.thinking, undefined] : [undefined]) {
-      // If thinking could not be switched off, the model needs room to think before it answers.
-      const thinkingStillOn = option.thinking && !thinking;
-      const generationConfig = { ...body.generationConfig, ...(thinking ? { thinkingConfig: thinking } : {}), ...(thinkingStillOn ? { maxOutputTokens: 4096 } : {}) };
-      const requestBody = { ...body, generationConfig };
+  const candidates = await getCandidateModels(apiKey);
+  const options: ModelOption[] = workingModel
+    ? [workingModel, ...candidates.filter((m) => m !== workingModel?.model).map((model) => ({ model }))]
+    : candidates.map((model) => ({ model }));
+  let lastError: GeminiError = new GeminiError("server", "no model available");
+
+  for (const [optionIndex, option] of options.entries()) {
+    const isRemembered = optionIndex === 0 && workingModel?.model === option.model;
+    const ladder = isRemembered ? [option.thinking, ...THINKING_LADDER.filter((t) => JSON.stringify(t) !== JSON.stringify(option.thinking))] : THINKING_LADDER;
+    for (const thinking of ladder) {
+      // Without a way to switch thinking off, the model needs room to think before it answers.
+      const generationConfig = { ...body.generationConfig, ...(thinking ? { thinkingConfig: thinking } : { maxOutputTokens: 4096 }) };
       const startedAt = Date.now();
       const seconds = () => ((Date.now() - startedAt) / 1000).toFixed(1);
       let response: Response;
       try {
-        response = await postWithTimeout(`${GEMINI_ENDPOINT}/${option.model}:generateContent?key=${encodeURIComponent(apiKey)}`, requestBody);
+        response = await postWithTimeout(`${GEMINI_ENDPOINT}/${option.model}:generateContent?key=${encodeURIComponent(apiKey)}`, { ...body, generationConfig });
       } catch (error) {
         const geminiError = error instanceof GeminiError ? error : new GeminiError("network", String(error));
         lastTrace.push(`${option.model} ${geminiError.code} ${seconds()}s`);
         lastError = geminiError;
         if (geminiError.code === "network") throw geminiError; // no internet: other models won't help
-        break; // timeout: try the next (faster) model
+        if (isRemembered) forgetWorkingModel();
+        break; // timeout: try the next model
       }
       if (response.ok) {
         const json = (await response.json()) as { candidates?: { finishReason?: string; content?: { parts?: { text?: string; thought?: boolean }[] } }[] };
@@ -172,11 +211,16 @@ async function callGeminiJson<T extends object>(request: GeminiRequest, apiKeyOv
         return parseLlmJson<T>(text);
       }
       const errorText = await response.text().catch(() => "");
-      lastTrace.push(`${option.model} HTTP ${response.status} ${seconds()}s`);
+      let errorMessage = errorText;
+      try { errorMessage = (JSON.parse(errorText) as { error?: { message?: string } }).error?.message ?? errorText; } catch { /* keep raw */ }
+      lastTrace.push(`${option.model} HTTP ${response.status} ${seconds()}s${response.status === 400 ? ` (${errorMessage.slice(0, 80)})` : ""}`);
       if (response.status === 400 && /API key not valid|API_KEY_INVALID/i.test(errorText)) throw new GeminiError("bad-key", errorText);
       if (response.status === 401 || response.status === 403) throw new GeminiError("bad-key", errorText);
-      if (response.status === 400 && thinking && /thinking/i.test(errorText)) continue;
+      // A rejected thinking setting: try the next way of switching thinking off.
+      if (response.status === 400 && thinking && /think/i.test(errorMessage)) continue;
       lastError = new GeminiError(response.status === 429 ? "quota" : "server", `${response.status} ${errorText}`);
+      if (response.status === 404) void AsyncStorage.removeItem(MODEL_LIST_KEY).catch(() => undefined);
+      if (isRemembered) forgetWorkingModel();
       break; // try the next model
     }
   }
@@ -192,11 +236,7 @@ export async function detectProductNameBox(imageBase64: string): Promise<LabelBo
     system: "คุณเป็นระบบหากรอบข้อความชื่อสินค้าในภาพถ่ายชั้นวางหรือฉลากสินค้า ให้คืนกรอบในพิกัด normalized 0 ถึง 1 (x,y คือมุมซ้ายบน) ลำดับความสำคัญ: 1) ป้ายราคา/ป้ายชื่อสีเหลืองบนชั้นวางที่มีชื่อสินค้า 2) ถ้าไม่มีป้ายเหลือง ให้ใช้บริเวณข้อความชื่อสินค้าที่ใหญ่และชัดที่สุดบนฉลากหรือบรรจุภัณฑ์ ไม่ต้องรวมบาร์โค้ด ราคา หรือรูปภาพที่ไม่เกี่ยวข้อง หากไม่พบข้อความเลยให้คืนกรอบเต็มภาพและ confidence ต่ำ",
     prompt: "หากรอบของชื่อสินค้าในภาพนี้ ให้ครอบทั้งบรรทัดชื่อสินค้าและเผื่อขอบเล็กน้อย",
     imageBase64,
-    schema: {
-      type: "OBJECT",
-      properties: { x: { type: "NUMBER" }, y: { type: "NUMBER" }, width: { type: "NUMBER" }, height: { type: "NUMBER" }, confidence: { type: "NUMBER" } },
-      required: ["x", "y", "width", "height", "confidence"],
-    },
+    jsonShape: '{"x": number, "y": number, "width": number, "height": number, "confidence": number}',
   });
   const clamp = (value: number | undefined, fallback: number) => Math.max(0, Math.min(1, Number.isFinite(value) ? value as number : fallback));
   const x = clamp(parsed.x, 0);
@@ -217,16 +257,7 @@ export async function readProductLabelImage(imageBase64: string, mimeType = "ima
     prompt: "ชื่อสินค้าในภาพนี้คืออะไร",
     imageBase64,
     mimeType,
-    schema: {
-      type: "OBJECT",
-      properties: {
-        productName: { type: "STRING" },
-        confidence: { type: "NUMBER" },
-        productCandidates: { type: "ARRAY", items: { type: "STRING" }, maxItems: 3 },
-      },
-      required: ["productName", "confidence", "productCandidates"],
-      propertyOrdering: ["productName", "confidence", "productCandidates"],
-    },
+    jsonShape: '{"productName": string, "confidence": number, "productCandidates": string[] (ไม่เกิน 3)}',
   });
   const productName = typeof result.productName === "string" ? result.productName : "";
   const rawConfidence = clampOcrConfidence(result.confidence);
@@ -239,7 +270,7 @@ export async function suggestNameCorrections(productName: string): Promise<strin
   const parsed = await callGeminiJson<{ suggestions: unknown }>({
     system: "คุณเป็นผู้ตรวจทานชื่อสินค้าไทยจากผล OCR ห้ามแต่งชื่อสินค้าใหม่ ห้ามเปลี่ยนชื่อแบรนด์โดยไม่มีเหตุผล และห้ามแนะนำราคา วันหมดอายุ ปริมาณ เลขล็อต หรือคำโฆษณา ให้เสนอคำแก้ไขเฉพาะเมื่อมีความเป็นไปได้ว่า OCR อ่านพยัญชนะ สระ วรรณยุกต์ หรือการเว้นวรรคผิด หากข้อความถูกต้องแล้วให้คืน suggestions เป็นอาร์เรย์ว่าง",
     prompt: `ตรวจทานผล OCR นี้: ${productName}\nเสนอคำแก้ไขภาษาไทยที่เป็นไปได้ไม่เกิน 3 รายการ เรียงจากน่าเชื่อถือที่สุด และต้องคงความหมายกับชื่อสินค้าเดิม`,
-    schema: { type: "OBJECT", properties: { suggestions: { type: "ARRAY", items: { type: "STRING" } } }, required: ["suggestions"] },
+    jsonShape: '{"suggestions": string[]}',
     maxOutputTokens: 512,
   });
   const values = Array.isArray(parsed.suggestions) ? parsed.suggestions : [];
@@ -251,7 +282,7 @@ export async function testGeminiApiKey(apiKey: string): Promise<void> {
   await callGeminiJson<{ ok: boolean }>({
     system: "ตอบ JSON เท่านั้น",
     prompt: "ตอบ ok เป็น true",
-    schema: { type: "OBJECT", properties: { ok: { type: "BOOLEAN" } }, required: ["ok"] },
+    jsonShape: '{"ok": true}',
     maxOutputTokens: 64,
   }, apiKey.trim());
 }
